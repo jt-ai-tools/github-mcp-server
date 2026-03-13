@@ -23,17 +23,17 @@
 - [x] `./docs/installation-guides/install-roo-code.md`
 - [x] `./docs/installation-guides/install-rovo-dev-cli.md`
 - [x] `./docs/installation-guides/install-windsurf.md`
-- [ ] `./docs/error-handling.md`
-- [ ] `./docs/host-integration.md`
-- [ ] `./docs/insiders-features.md`
-- [ ] `./docs/policies-and-governance.md`
-- [ ] `./docs/remote-server.md`
-- [ ] `./docs/scope-filtering.md`
-- [ ] `./docs/server-configuration.md`
-- [ ] `./docs/streamable-http.md`
-- [ ] `./docs/testing.md`
-- [ ] `./docs/tool-renaming.md`
-- [ ] `./docs/toolsets-and-icons.md`
+- [x] `./docs/error-handling.md`
+- [x] `./docs/host-integration.md`
+- [x] `./docs/insiders-features.md`
+- [x] `./docs/policies-and-governance.md`
+- [x] `./docs/remote-server.md`
+- [x] `./docs/scope-filtering.md`
+- [x] `./docs/server-configuration.md`
+- [x] `./docs/streamable-http.md`
+- [x] `./docs/testing.md`
+- [x] `./docs/tool-renaming.md`
+- [x] `./docs/toolsets-and-icons.md`
 - [ ] `./e2e/README.md`
 - [ ] `./cmd/mcpcurl/README.md`
 - [ ] `./.github/agents/go-sdk-tool-migrator.md`
