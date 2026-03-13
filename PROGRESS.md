@@ -15,14 +15,14 @@
 - [x] `./docs/installation-guides/install-antigravity.md`
 - [x] `./docs/installation-guides/install-claude.md`
 - [x] `./docs/installation-guides/install-cline.md`
-- [ ] `./docs/installation-guides/install-codex.md`
-- [ ] `./docs/installation-guides/install-copilot-cli.md`
-- [ ] `./docs/installation-guides/install-cursor.md`
-- [ ] `./docs/installation-guides/install-gemini-cli.md`
-- [ ] `./docs/installation-guides/install-other-copilot-ides.md`
-- [ ] `./docs/installation-guides/install-roo-code.md`
-- [ ] `./docs/installation-guides/install-rovo-dev-cli.md`
-- [ ] `./docs/installation-guides/install-windsurf.md`
+- [x] `./docs/installation-guides/install-codex.md`
+- [x] `./docs/installation-guides/install-copilot-cli.md`
+- [x] `./docs/installation-guides/install-cursor.md`
+- [x] `./docs/installation-guides/install-gemini-cli.md`
+- [x] `./docs/installation-guides/install-other-copilot-ides.md`
+- [x] `./docs/installation-guides/install-roo-code.md`
+- [x] `./docs/installation-guides/install-rovo-dev-cli.md`
+- [x] `./docs/installation-guides/install-windsurf.md`
 - [ ] `./docs/error-handling.md`
 - [ ] `./docs/host-integration.md`
 - [ ] `./docs/insiders-features.md`
