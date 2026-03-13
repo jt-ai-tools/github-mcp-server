@@ -34,13 +34,13 @@
 - [x] `./docs/testing.md`
 - [x] `./docs/tool-renaming.md`
 - [x] `./docs/toolsets-and-icons.md`
-- [ ] `./e2e/README.md`
-- [ ] `./cmd/mcpcurl/README.md`
-- [ ] `./.github/agents/go-sdk-tool-migrator.md`
-- [ ] `./.github/ISSUE_TEMPLATE/feature_request.md`
-- [ ] `./.github/ISSUE_TEMPLATE/bug_report.md`
-- [ ] `./.github/copilot-instructions.md`
-- [ ] `./.github/pull_request_template.md`
-- [ ] `./third-party-licenses.linux.md`
-- [ ] `./third-party-licenses.windows.md`
-- [ ] `./third-party-licenses.darwin.md`
+- [x] `./e2e/README.md`
+- [x] `./cmd/mcpcurl/README.md`
+- [x] `./.github/agents/go-sdk-tool-migrator.md`
+- [x] `./.github/ISSUE_TEMPLATE/feature_request.md`
+- [x] `./.github/ISSUE_TEMPLATE/bug_report.md`
+- [x] `./.github/copilot-instructions.md`
+- [x] `./.github/pull_request_template.md`
+- [x] `./third-party-licenses.linux.md`
+- [x] `./third-party-licenses.windows.md`
+- [x] `./third-party-licenses.darwin.md`
