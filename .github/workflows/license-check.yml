@@ -68,7 +68,7 @@ jobs:
           git push
 
       - name: Check if already commented
-        if: steps.changes.outcome == 'failure' && steps.push.outcome == 'failure'
+        if: "steps.changes.outcome == 'failure' && (steps.push.outcome == 'failure' || (github.repository != 'github/github-mcp-server' && steps.push.outcome == 'skipped'))"
         id: check_comment
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
@@ -87,29 +87,10 @@ jobs:
             core.setOutput('already_commented', alreadyCommented ? 'true' : 'false');
 
       - name: Comment with instructions if cannot push
-        if: "${{ github.repository == 'github/github-mcp-server' && (steps.changes.outcome == 'failure' && steps.push.outcome == 'failure' && steps.check_comment.outputs.already_commented == 'false') }}"
+        if: "steps.changes.outcome == 'failure' && (steps.push.outcome == 'failure' || (github.repository != 'github/github-mcp-server' && steps.push.outcome == 'skipped')) && steps.check_comment.outputs.already_commented == 'false'"
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `## ⚠️ License files need updating
-            
-            The license files are out of date. I tried to fix them automatically but don't have permission to push to this branch.
-            
-            **Please run:**
-            \`\`\`bash
-            script/licenses
-            git add third-party-licenses.*.md third-party/
-            git commit -m "chore: regenerate license files"
-            git push
-            \`\`\`
-            
-            Alternatively, enable "Allow edits by maintainers" in the PR settings so I can fix it automatically.`
-            });
-
+          script: "await github.rest.issues.createComment({\n  owner: context.repo.owner,\n  repo: context.repo.repo,\n  issue_number: context.issue.number,\n  body: `## \u26a0\ufe0f License files need updating\n\nThe license files are out of date. Automatic fixes were not pushed to this branch.\n\n**Please run:**\n\\`\\`\\`bash\nscript/licenses\ngit add third-party-licenses.*.md third-party/\ngit commit -m \"chore: regenerate license files\"\ngit push\n\\`\\`\\`\n\nAutomatic pushes run only in the upstream repository; fork contributors can apply the commands above.`\n});\n"
       - name: Fail check if changes needed
         if: steps.changes.outcome == 'failure'
         run: exit 1
