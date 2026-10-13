@@ -5,10 +5,12 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/github/github-mcp-server/pkg/inventory"
-	"github.com/github/github-mcp-server/pkg/translations"
-	"github.com/google/go-github/v82/github"
+	"github.com/google/go-github/v92/github"
 	"github.com/shurcooL/githubv4"
+
+	"github.com/github/github-mcp-server/v2/pkg/inventory"
+	"github.com/github/github-mcp-server/v2/pkg/translations"
+	"github.com/github/github-mcp-server/v2/pkg/utils"
 )
 
 type GetClientFn func(context.Context) (*github.Client, error)
@@ -71,10 +73,20 @@ var (
 		Description: "GitHub Organization related tools",
 		Icon:        "organization",
 	}
+	ToolsetMetadataGovernance = inventory.ToolsetMetadata{
+		ID:          "governance",
+		Description: "Repository governance tools for managing rulesets and custom properties at the repository, organization, and enterprise levels",
+		Icon:        "law",
+	}
 	ToolsetMetadataActions = inventory.ToolsetMetadata{
 		ID:          "actions",
 		Description: "GitHub Actions workflows and CI/CD operations",
 		Icon:        "workflow",
+	}
+	ToolsetMetadataCodeQuality = inventory.ToolsetMetadata{
+		ID:          "code_quality",
+		Description: "GitHub Code Quality related tools",
+		Icon:        "code-square",
 	}
 	ToolsetMetadataCodeSecurity = inventory.ToolsetMetadata{
 		ID:          "code_security",
@@ -123,11 +135,6 @@ var (
 		Description: "GitHub Stargazers related tools",
 		Icon:        "star",
 	}
-	ToolsetMetadataDynamic = inventory.ToolsetMetadata{
-		ID:          "dynamic",
-		Description: "Discover GitHub MCP tools that can help achieve tasks by enabling additional sets of tools, you can control the enablement of any toolset to access its tools when this toolset is enabled.",
-		Icon:        "tools",
-	}
 	ToolsetLabels = inventory.ToolsetMetadata{
 		ID:          "labels",
 		Description: "GitHub Labels related tools",
@@ -141,6 +148,30 @@ var (
 		Icon:        "copilot",
 	}
 
+	// ToolsetMetadataCopilotIssueIntents is a non-default toolset that gates the
+	// opt-in intent-aware Copilot issue assignment tool. Kept out of the default
+	// configuration so its inputs (rationale, confidence, is_suggestion) do not
+	// add schema bloat to the default tool surface.
+	ToolsetMetadataCopilotIssueIntents = inventory.ToolsetMetadata{
+		ID:          "copilot_issue_intents",
+		Description: "Opt-in Copilot issue assignment tools that carry intent metadata (rationale, confidence, suggestion)",
+		Icon:        "copilot",
+	}
+
+	// Feature flag names for granular tool variants.
+	// When active, consolidated tools are replaced by single-purpose granular tools.
+	FeatureFlagIssuesGranular       = "issues_granular"
+	FeatureFlagPullRequestsGranular = "pull_requests_granular"
+)
+
+// HeaderAllowedFeatureFlags returns the feature flags that clients may enable
+// through the X-MCP-Features header or features URL query parameter. It
+// delegates to AllowedFeatureFlags as the single source of truth.
+func HeaderAllowedFeatureFlags() []string {
+	return slices.Clone(AllowedFeatureFlags)
+}
+
+var (
 	// Remote-only toolsets - these are only available in the remote MCP server
 	// but are documented here for consistency and to enable automated documentation.
 	ToolsetMetadataCopilotSpaces = inventory.ToolsetMetadata{
@@ -155,10 +186,37 @@ var (
 	}
 )
 
+// ToolOption configures how tools are built. Options carry deployment
+// capabilities that are known when the inventory is constructed, so a tool's
+// description and its behaviour are decided from the same value and cannot
+// drift apart.
+type ToolOption func(*toolConfig)
+
+type toolConfig struct {
+	// hostType is the deployment the tools will talk to. The zero value is
+	// dotcom, which is also what an empty GITHUB_HOST resolves to.
+	hostType utils.HostType
+}
+
+// WithHost tells the tools which deployment they will talk to, so those with
+// host-specific capabilities can adapt. Derive it from utils.ParseHostType.
+func WithHost(h utils.HostType) ToolOption {
+	return func(c *toolConfig) { c.hostType = h }
+}
+
+func newToolConfig(opts []ToolOption) toolConfig {
+	var cfg toolConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg
+}
+
 // AllTools returns all tools with their embedded toolset metadata.
 // Tool functions return ServerTool directly with toolset info.
-func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
-	return []inventory.ServerTool{
+func AllTools(t translations.TranslationHelperFunc, opts ...ToolOption) []inventory.ServerTool {
+	cfg := newToolConfig(opts)
+	return withCSVOutput([]inventory.ServerTool{
 		// Context tools
 		GetMe(t),
 		GetTeams(t),
@@ -169,7 +227,9 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		GetFileContents(t),
 		ListCommits(t),
 		SearchCode(t),
+		SearchCommits(t),
 		GetCommit(t),
+		GetFileBlame(t),
 		ListBranches(t),
 		ListTags(t),
 		GetTag(t),
@@ -178,6 +238,7 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		GetReleaseByTag(t),
 		CreateOrUpdateFile(t),
 		CreateRepository(t),
+		DeleteRepository(t),
 		ForkRepository(t),
 		CreateBranch(t),
 		PushFiles(t),
@@ -185,24 +246,36 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		ListStarredRepositories(t),
 		StarRepository(t),
 		UnstarRepository(t),
+		ListRepositoryCollaborators(t),
 
 		// Git tools
 		GetRepositoryTree(t),
 
 		// Issue tools
 		IssueRead(t),
-		SearchIssues(t),
+		SearchIssues(t, opts...),
 		ListIssues(t),
 		ListIssueTypes(t),
+		ListIssueFields(t),
 		IssueWrite(t),
 		AddIssueComment(t),
+		UpdateIssueComment(t),
 		SubIssueWrite(t),
+		IssueDependencyRead(t),
+		IssueDependencyWrite(t),
+		FindDuplicate(t),
 
 		// User tools
 		SearchUsers(t),
 
 		// Organization tools
 		SearchOrgs(t),
+
+		// Governance tools
+		RepositoryRulesetRead(t),
+		CreateRepositoryRuleset(t),
+		CustomPropertiesRead(t),
+		CustomPropertiesWrite(t),
 
 		// Pull request tools
 		PullRequestRead(t),
@@ -212,13 +285,20 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		UpdatePullRequestBranch(t),
 		CreatePullRequest(t),
 		UpdatePullRequest(t),
-		PullRequestReviewWrite(t),
+		pullRequestReviewWrite(t, false, cfg),
+		PullRequestReviewWriteWithResolutionReason(t, opts...),
 		AddCommentToPendingReview(t),
 		AddReplyToPullRequestComment(t),
 
 		// Copilot tools
 		AssignCopilotToIssue(t),
 		RequestCopilotReview(t),
+
+		// Copilot issue intents (non-default, opt-in)
+		AssignCopilotToIssueWithIntent(t),
+
+		// Code quality tools
+		GetCodeQualityFinding(t),
 
 		// Code security tools
 		GetCodeScanningAlert(t),
@@ -244,6 +324,7 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		ListDiscussions(t),
 		GetDiscussion(t),
 		GetDiscussionComments(t),
+		DiscussionCommentWrite(t),
 		ListDiscussionCategories(t),
 
 		// Actions tools
@@ -274,7 +355,50 @@ func AllTools(t translations.TranslationHelperFunc) []inventory.ServerTool {
 		GetLabelForLabelsToolset(t),
 		ListLabels(t),
 		LabelWrite(t),
-	}
+
+		// UI tools (insiders only)
+		UIGet(t),
+
+		// Granular issue tools (feature-flagged, replace consolidated issue_write/sub_issue_write)
+		GranularCreateIssue(t),
+		GranularUpdateIssueTitle(t),
+		GranularUpdateIssueBody(t),
+		GranularUpdateIssueAssignees(t),
+		GranularUpdateIssueLabels(t),
+		GranularUpdateIssueMilestone(t),
+		GranularUpdateIssueType(t),
+		GranularUpdateIssueState(t),
+		GranularAddSubIssue(t),
+		GranularRemoveSubIssue(t),
+		GranularReprioritizeSubIssue(t),
+		GranularSetIssueFields(t),
+		GranularAddIssueReaction(t),
+		GranularRemoveIssueReaction(t),
+		GranularAddIssueCommentReaction(t),
+		GranularRemoveIssueCommentReaction(t),
+		GranularHideIssueComment(t),
+		GranularUnhideIssueComment(t),
+
+		// Granular pull request tools (feature-flagged, replace consolidated update_pull_request/pull_request_review_write)
+		GranularUpdatePullRequestTitle(t),
+		GranularUpdatePullRequestBody(t),
+		GranularUpdatePullRequestState(t),
+		GranularUpdatePullRequestDraftState(t),
+		GranularRequestPullRequestReviewers(t),
+		GranularCreatePullRequestReview(t),
+		GranularSubmitPendingPullRequestReview(t),
+		GranularDeletePendingPullRequestReview(t),
+		GranularAddPullRequestReviewComment(t),
+		granularResolveReviewThread(t, false, cfg),
+		GranularResolveReviewThreadWithResolutionReason(t, opts...),
+		GranularUnresolveReviewThread(t),
+		GranularAddPullRequestReviewCommentReaction(t),
+		GranularRemovePullRequestReviewCommentReaction(t),
+		GranularHidePullRequestReviewComment(t),
+		GranularUnhidePullRequestReviewComment(t),
+		GranularHidePullRequestReview(t),
+		GranularUnhidePullRequestReview(t),
+	})
 }
 
 // ToBoolPtr converts a bool to a *bool pointer.
@@ -307,8 +431,8 @@ func GenerateToolsetsHelp() string {
 		defaultBuf.WriteString(string(id))
 	}
 
-	// Get all available toolsets (excludes context and dynamic for display)
-	allToolsets := r.AvailableToolsets("context", "dynamic")
+	// Get all available toolsets (excludes context for display)
+	allToolsets := r.AvailableToolsets("context")
 	var availableBuf strings.Builder
 	const maxLineLength = 70
 	currentLine := ""

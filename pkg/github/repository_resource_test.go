@@ -2,13 +2,15 @@ package github
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
-	"github.com/github/github-mcp-server/pkg/raw"
-	"github.com/google/go-github/v82/github"
+	"github.com/github/github-mcp-server/v2/pkg/raw"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
 )
@@ -78,7 +80,7 @@ func Test_repositoryResourceContents(t *testing.T) {
 			mockedClient: MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
 				GetRawReposContentsByOwnerByRepoByPath: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 					w.Header().Set("Content-Type", "image/png")
-					_, err := w.Write([]byte("# Test Repository\n\nThis is a test repository."))
+					_, err := w.Write([]byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"))
 					require.NoError(t, err)
 				}),
 			}),
@@ -89,7 +91,7 @@ func Test_repositoryResourceContents(t *testing.T) {
 			expectedResponseType: resourceResponseTypeBlob,
 			expectedResult: &mcp.ReadResourceResult{
 				Contents: []*mcp.ResourceContents{{
-					Blob:     []byte("IyBUZXN0IFJlcG9zaXRvcnkKClRoaXMgaXMgYSB0ZXN0IHJlcG9zaXRvcnku"),
+					Blob:     []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"),
 					MIMEType: "image/png",
 					URI:      "",
 				}}},
@@ -246,8 +248,9 @@ func Test_repositoryResourceContents(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			client := github.NewClient(tc.mockedClient)
-			mockRawClient := raw.NewClient(client, base)
+			client := mustNewGHClient(t, tc.mockedClient)
+			mockRawClient, err := raw.NewClient(client, base)
+			require.NoError(t, err)
 			deps := BaseDeps{
 				Client:    client,
 				RawClient: mockRawClient,
@@ -274,6 +277,20 @@ func Test_repositoryResourceContents(t *testing.T) {
 			switch tc.expectedResponseType {
 			case resourceResponseTypeBlob:
 				require.Equal(t, tc.expectedResult.Contents[0].Blob, content.Blob)
+
+				wireBytes, err := json.Marshal(resp)
+				require.NoError(t, err)
+				var wireResult struct {
+					Contents []struct {
+						Blob string `json:"blob"`
+					} `json:"contents"`
+				}
+				require.NoError(t, json.Unmarshal(wireBytes, &wireResult))
+				require.Len(t, wireResult.Contents, 1)
+				decodedBlob, err := base64.StdEncoding.DecodeString(wireResult.Contents[0].Blob)
+				require.NoError(t, err)
+				require.Equal(t, tc.expectedResult.Contents[0].Blob, decodedBlob)
+				require.True(t, strings.HasPrefix(string(decodedBlob), "\x89PNG\r\n\x1a\n"))
 			case resourceResponseTypeText:
 				require.Equal(t, tc.expectedResult.Contents[0].Text, content.Text)
 			default:
@@ -290,8 +307,9 @@ func Test_repositoryResourceContentsHandler_NetworkError(t *testing.T) {
 	networkErr := errors.New("network error: connection refused")
 
 	httpClient := &http.Client{Transport: &errorTransport{err: networkErr}}
-	client := github.NewClient(httpClient)
-	mockRawClient := raw.NewClient(client, base)
+	client := mustNewGHClient(t, httpClient)
+	mockRawClient, err := raw.NewClient(client, base)
+	require.NoError(t, err)
 	deps := BaseDeps{
 		Client:    client,
 		RawClient: mockRawClient,

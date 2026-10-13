@@ -4,13 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
-	"github.com/github/github-mcp-server/pkg/inventory"
-	"github.com/github/github-mcp-server/pkg/scopes"
-	"github.com/github/github-mcp-server/pkg/translations"
-	"github.com/github/github-mcp-server/pkg/utils"
-	"github.com/go-viper/mapstructure/v2"
-	"github.com/google/go-github/v82/github"
+	"github.com/github/github-mcp-server/v2/pkg/ifc"
+	"github.com/github/github-mcp-server/v2/pkg/inventory"
+	"github.com/github/github-mcp-server/v2/pkg/sanitize"
+	"github.com/github/github-mcp-server/v2/pkg/scopes"
+	"github.com/github/github-mcp-server/v2/pkg/translations"
+	"github.com/github/github-mcp-server/v2/pkg/utils"
+	"github.com/google/go-github/v92/github"
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/shurcooL/githubv4"
@@ -96,16 +98,16 @@ type WithCategoryNoOrder struct {
 
 func fragmentToDiscussion(fragment NodeFragment) *github.Discussion {
 	return &github.Discussion{
-		Number:    github.Ptr(int(fragment.Number)),
-		Title:     github.Ptr(string(fragment.Title)),
-		HTMLURL:   github.Ptr(string(fragment.URL)),
+		Number:    new(int(fragment.Number)),
+		Title:     new(sanitize.PlainText(string(fragment.Title))),
+		HTMLURL:   new(string(fragment.URL)),
 		CreatedAt: &github.Timestamp{Time: fragment.CreatedAt.Time},
 		UpdatedAt: &github.Timestamp{Time: fragment.UpdatedAt.Time},
 		User: &github.User{
-			Login: github.Ptr(string(fragment.Author.Login)),
+			Login: new(string(fragment.Author.Login)),
 		},
 		DiscussionCategory: &github.DiscussionCategory{
-			Name: github.Ptr(string(fragment.Category.Name)),
+			Name: new(string(fragment.Category.Name)),
 		},
 	}
 }
@@ -124,11 +126,12 @@ func getQueryType(useOrdering bool, categoryID *githubv4.ID) any {
 }
 
 func ListDiscussions(t translations.TranslationHelperFunc) inventory.ServerTool {
-	return NewTool(
+	return NewTool[ListDiscussionsInput, *ListDiscussionsOutput](
 		ToolsetMetadataDiscussions,
 		mcp.Tool{
-			Name:        "list_discussions",
-			Description: t("TOOL_LIST_DISCUSSIONS_DESCRIPTION", "List discussions for a repository or organisation."),
+			Name:         "list_discussions",
+			OutputSchema: discussionNotificationOutputSchema[ListDiscussionsOutput](),
+			Description:  t("TOOL_LIST_DISCUSSIONS_DESCRIPTION", "List discussions for a repository or organisation."),
 			Annotations: &mcp.ToolAnnotations{
 				Title:        t("TOOL_LIST_DISCUSSIONS_USER_TITLE", "List discussions"),
 				ReadOnlyHint: true,
@@ -162,8 +165,12 @@ func ListDiscussions(t translations.TranslationHelperFunc) inventory.ServerTool 
 				Required: []string{"owner"},
 			}),
 		},
-		[]scopes.Scope{scopes.Repo},
-		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+		scopes.PublicRead(scopes.Repo),
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, input ListDiscussionsInput) (*mcp.CallToolResult, *ListDiscussionsOutput, error) {
+			args, err := discussionNotificationArguments(input)
+			if err != nil {
+				return nil, nil, err
+			}
 			owner, err := RequiredParam[string](args, "owner")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
@@ -271,17 +278,38 @@ func ListDiscussions(t translations.TranslationHelperFunc) inventory.ServerTool 
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to marshal discussions: %w", err)
 			}
-			return utils.NewToolResultText(string(out)), nil, nil
+			result := utils.NewToolResultText(string(out))
+			// Discussion content is user-authored (untrusted); confidentiality
+			// follows repo visibility.
+			result = attachRepoVisibilityIFCLabelLazy(ctx, deps, owner, repo, result, ifc.LabelRepoUserContent)
+			items := make([]*DiscussionListItemOutput, 0, len(discussions))
+			for _, discussion := range discussions {
+				items = append(items, &DiscussionListItemOutput{
+					Number: discussion.Number, Title: discussion.Title, HTMLURL: discussion.HTMLURL,
+					CreatedAt: &discussion.CreatedAt.Time, UpdatedAt: &discussion.UpdatedAt.Time,
+					Author: discussion.User.GetLogin(), Category: discussion.DiscussionCategory.GetName(),
+				})
+			}
+			return result, &ListDiscussionsOutput{
+				Discussions: items,
+				PageInfo: DiscussionPageInfoOutput{
+					HasNextPage: pageInfo.HasNextPage, HasPreviousPage: pageInfo.HasPreviousPage,
+					StartCursor: string(pageInfo.StartCursor), EndCursor: string(pageInfo.EndCursor),
+				},
+				TotalCount: int(totalCount),
+			}, nil
 		},
+		normalizeDiscussionNotificationIntegers("perPage"),
 	)
 }
 
 func GetDiscussion(t translations.TranslationHelperFunc) inventory.ServerTool {
-	return NewTool(
+	return NewTool[GetDiscussionInput, *DiscussionOutput](
 		ToolsetMetadataDiscussions,
 		mcp.Tool{
-			Name:        "get_discussion",
-			Description: t("TOOL_GET_DISCUSSION_DESCRIPTION", "Get a specific discussion by ID"),
+			Name:         "get_discussion",
+			OutputSchema: discussionNotificationOutputSchema[DiscussionOutput](),
+			Description:  t("TOOL_GET_DISCUSSION_DESCRIPTION", "Get a specific discussion by ID"),
 			Annotations: &mcp.ToolAnnotations{
 				Title:        t("TOOL_GET_DISCUSSION_USER_TITLE", "Get discussion"),
 				ReadOnlyHint: true,
@@ -305,17 +333,8 @@ func GetDiscussion(t translations.TranslationHelperFunc) inventory.ServerTool {
 				Required: []string{"owner", "repo", "discussionNumber"},
 			},
 		},
-		[]scopes.Scope{scopes.Repo},
-		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
-			// Decode params
-			var params struct {
-				Owner            string
-				Repo             string
-				DiscussionNumber int32
-			}
-			if err := mapstructure.WeakDecode(args, &params); err != nil {
-				return utils.NewToolResultError(err.Error()), nil, nil
-			}
+		scopes.PublicRead(scopes.Repo),
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, params GetDiscussionInput) (*mcp.CallToolResult, *DiscussionOutput, error) {
 			client, err := deps.GetGQLClient(ctx)
 			if err != nil {
 				return utils.NewToolResultError(fmt.Sprintf("failed to get GitHub GQL client: %v", err)), nil, nil
@@ -354,8 +373,8 @@ func GetDiscussion(t translations.TranslationHelperFunc) inventory.ServerTool {
 			// like ListDiscussions and GetDiscussionComments).
 			response := map[string]any{
 				"number":     int(d.Number),
-				"title":      string(d.Title),
-				"body":       string(d.Body),
+				"title":      sanitize.PlainText(string(d.Title)),
+				"body":       sanitize.Content(string(d.Body)),
 				"url":        string(d.URL),
 				"closed":     bool(d.Closed),
 				"isAnswered": bool(d.IsAnswered),
@@ -375,17 +394,32 @@ func GetDiscussion(t translations.TranslationHelperFunc) inventory.ServerTool {
 				return nil, nil, fmt.Errorf("failed to marshal discussion: %w", err)
 			}
 
-			return utils.NewToolResultText(string(out)), nil, nil
+			result := utils.NewToolResultText(string(out))
+			// Discussion content is user-authored (untrusted); confidentiality
+			// follows repo visibility.
+			result = attachRepoVisibilityIFCLabelLazy(ctx, deps, params.Owner, params.Repo, result, ifc.LabelRepoUserContent)
+			output := &DiscussionOutput{
+				Number: int(d.Number), Title: sanitize.PlainText(string(d.Title)),
+				Body: sanitize.Content(string(d.Body)), HTMLURL: string(d.URL),
+				Closed: bool(d.Closed), IsAnswered: bool(d.IsAnswered), CreatedAt: d.CreatedAt.Time,
+				Category: DiscussionCategoryOutput{Name: string(d.Category.Name)},
+			}
+			if d.AnswerChosenAt != nil {
+				output.AnswerChosenAt = &d.AnswerChosenAt.Time
+			}
+			return result, output, nil
 		},
+		normalizeDiscussionReadArguments,
 	)
 }
 
 func GetDiscussionComments(t translations.TranslationHelperFunc) inventory.ServerTool {
-	return NewTool(
+	return NewTool[GetDiscussionCommentsInput, *DiscussionCommentsOutput](
 		ToolsetMetadataDiscussions,
 		mcp.Tool{
-			Name:        "get_discussion_comments",
-			Description: t("TOOL_GET_DISCUSSION_COMMENTS_DESCRIPTION", "Get comments from a discussion"),
+			Name:         "get_discussion_comments",
+			OutputSchema: discussionNotificationOutputSchema[DiscussionCommentsOutput](),
+			Description:  t("TOOL_GET_DISCUSSION_COMMENTS_DESCRIPTION", "Get comments from a discussion"),
 			Annotations: &mcp.ToolAnnotations{
 				Title:        t("TOOL_GET_DISCUSSION_COMMENTS_USER_TITLE", "Get discussion comments"),
 				ReadOnlyHint: true,
@@ -405,19 +439,23 @@ func GetDiscussionComments(t translations.TranslationHelperFunc) inventory.Serve
 						Type:        "number",
 						Description: "Discussion Number",
 					},
+					"includeReplies": {
+						Type:        "boolean",
+						Description: "When true, each top-level comment will include its replies nested within it (up to 100 replies per comment, which is the GitHub API maximum). Defaults to false.",
+					},
 				},
 				Required: []string{"owner", "repo", "discussionNumber"},
 			}),
 		},
-		[]scopes.Scope{scopes.Repo},
-		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
-			// Decode params
-			var params struct {
-				Owner            string
-				Repo             string
-				DiscussionNumber int32
+		scopes.PublicRead(scopes.Repo),
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, params GetDiscussionCommentsInput) (*mcp.CallToolResult, *DiscussionCommentsOutput, error) {
+			args, err := discussionNotificationArguments(params)
+			if err != nil {
+				return nil, nil, err
 			}
-			if err := mapstructure.WeakDecode(args, &params); err != nil {
+
+			includeReplies, err := OptionalParam[bool](args, "includeReplies")
+			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 
@@ -447,24 +485,6 @@ func GetDiscussionComments(t translations.TranslationHelperFunc) inventory.Serve
 				return utils.NewToolResultError(fmt.Sprintf("failed to get GitHub GQL client: %v", err)), nil, nil
 			}
 
-			var q struct {
-				Repository struct {
-					Discussion struct {
-						Comments struct {
-							Nodes []struct {
-								Body githubv4.String
-							}
-							PageInfo struct {
-								HasNextPage     githubv4.Boolean
-								HasPreviousPage githubv4.Boolean
-								StartCursor     githubv4.String
-								EndCursor       githubv4.String
-							}
-							TotalCount int
-						} `graphql:"comments(first: $first, after: $after)"`
-					} `graphql:"discussion(number: $discussionNumber)"`
-				} `graphql:"repository(owner: $owner, name: $repo)"`
-			}
 			vars := map[string]any{
 				"owner":            githubv4.String(params.Owner),
 				"repo":             githubv4.String(params.Repo),
@@ -476,25 +496,99 @@ func GetDiscussionComments(t translations.TranslationHelperFunc) inventory.Serve
 			} else {
 				vars["after"] = (*githubv4.String)(nil)
 			}
-			if err := client.Query(ctx, &q, vars); err != nil {
-				return utils.NewToolResultError(err.Error()), nil, nil
-			}
 
-			var comments []*github.IssueComment
-			for _, c := range q.Repository.Discussion.Comments.Nodes {
-				comments = append(comments, &github.IssueComment{Body: github.Ptr(string(c.Body))})
+			var comments []MinimalDiscussionComment
+			var pageInfo struct {
+				HasNextPage     githubv4.Boolean
+				HasPreviousPage githubv4.Boolean
+				StartCursor     githubv4.String
+				EndCursor       githubv4.String
+			}
+			var totalCount int
+
+			if includeReplies {
+				var q struct {
+					Repository struct {
+						Discussion struct {
+							Comments struct {
+								Nodes []struct {
+									ID       githubv4.ID
+									Body     githubv4.String
+									IsAnswer githubv4.Boolean
+									Replies  struct {
+										Nodes []struct {
+											ID       githubv4.ID
+											Body     githubv4.String
+											IsAnswer githubv4.Boolean
+										}
+										TotalCount int
+									} `graphql:"replies(first: 100)"`
+								}
+								PageInfo struct {
+									HasNextPage     githubv4.Boolean
+									HasPreviousPage githubv4.Boolean
+									StartCursor     githubv4.String
+									EndCursor       githubv4.String
+								}
+								TotalCount int
+							} `graphql:"comments(first: $first, after: $after)"`
+						} `graphql:"discussion(number: $discussionNumber)"`
+					} `graphql:"repository(owner: $owner, name: $repo)"`
+				}
+				if err := client.Query(ctx, &q, vars); err != nil {
+					return utils.NewToolResultError(err.Error()), nil, nil
+				}
+				for _, c := range q.Repository.Discussion.Comments.Nodes {
+					comment := newMinimalDiscussionComment(fmt.Sprintf("%v", c.ID), string(c.Body), bool(c.IsAnswer))
+					comment.ReplyTotalCount = c.Replies.TotalCount
+					for _, r := range c.Replies.Nodes {
+						comment.Replies = append(comment.Replies, newMinimalDiscussionComment(fmt.Sprintf("%v", r.ID), string(r.Body), bool(r.IsAnswer)))
+					}
+					comments = append(comments, comment)
+				}
+				pageInfo = q.Repository.Discussion.Comments.PageInfo
+				totalCount = q.Repository.Discussion.Comments.TotalCount
+			} else {
+				var q struct {
+					Repository struct {
+						Discussion struct {
+							Comments struct {
+								Nodes []struct {
+									ID       githubv4.ID
+									Body     githubv4.String
+									IsAnswer githubv4.Boolean
+								}
+								PageInfo struct {
+									HasNextPage     githubv4.Boolean
+									HasPreviousPage githubv4.Boolean
+									StartCursor     githubv4.String
+									EndCursor       githubv4.String
+								}
+								TotalCount int
+							} `graphql:"comments(first: $first, after: $after)"`
+						} `graphql:"discussion(number: $discussionNumber)"`
+					} `graphql:"repository(owner: $owner, name: $repo)"`
+				}
+				if err := client.Query(ctx, &q, vars); err != nil {
+					return utils.NewToolResultError(err.Error()), nil, nil
+				}
+				for _, c := range q.Repository.Discussion.Comments.Nodes {
+					comments = append(comments, newMinimalDiscussionComment(fmt.Sprintf("%v", c.ID), string(c.Body), bool(c.IsAnswer)))
+				}
+				pageInfo = q.Repository.Discussion.Comments.PageInfo
+				totalCount = q.Repository.Discussion.Comments.TotalCount
 			}
 
 			// Create response with pagination info
 			response := map[string]any{
 				"comments": comments,
 				"pageInfo": map[string]any{
-					"hasNextPage":     q.Repository.Discussion.Comments.PageInfo.HasNextPage,
-					"hasPreviousPage": q.Repository.Discussion.Comments.PageInfo.HasPreviousPage,
-					"startCursor":     string(q.Repository.Discussion.Comments.PageInfo.StartCursor),
-					"endCursor":       string(q.Repository.Discussion.Comments.PageInfo.EndCursor),
+					"hasNextPage":     pageInfo.HasNextPage,
+					"hasPreviousPage": pageInfo.HasPreviousPage,
+					"startCursor":     string(pageInfo.StartCursor),
+					"endCursor":       string(pageInfo.EndCursor),
 				},
-				"totalCount": q.Repository.Discussion.Comments.TotalCount,
+				"totalCount": totalCount,
 			}
 
 			out, err := json.Marshal(response)
@@ -502,17 +596,441 @@ func GetDiscussionComments(t translations.TranslationHelperFunc) inventory.Serve
 				return nil, nil, fmt.Errorf("failed to marshal comments: %w", err)
 			}
 
-			return utils.NewToolResultText(string(out)), nil, nil
+			result := utils.NewToolResultText(string(out))
+			// Discussion comments are user-authored (untrusted); confidentiality
+			// follows repo visibility.
+			result = attachRepoVisibilityIFCLabelLazy(ctx, deps, params.Owner, params.Repo, result, ifc.LabelRepoUserContent)
+			return result, &DiscussionCommentsOutput{
+				Comments: discussionCommentOutputs(comments),
+				PageInfo: DiscussionPageInfoOutput{
+					HasNextPage: bool(pageInfo.HasNextPage), HasPreviousPage: bool(pageInfo.HasPreviousPage),
+					StartCursor: string(pageInfo.StartCursor), EndCursor: string(pageInfo.EndCursor),
+				},
+				TotalCount: totalCount,
+			}, nil
 		},
+		normalizeDiscussionReadArguments,
+		normalizeDiscussionNotificationIntegers("perPage"),
 	)
 }
 
-func ListDiscussionCategories(t translations.TranslationHelperFunc) inventory.ServerTool {
-	return NewTool(
+func DiscussionCommentWrite(t translations.TranslationHelperFunc) inventory.ServerTool {
+	return NewTool[DiscussionCommentWriteInput, *DiscussionCommentWriteOutput](
 		ToolsetMetadataDiscussions,
 		mcp.Tool{
-			Name:        "list_discussion_categories",
-			Description: t("TOOL_LIST_DISCUSSION_CATEGORIES_DESCRIPTION", "List discussion categories with their id and name, for a repository or organisation."),
+			Name:         "discussion_comment_write",
+			OutputSchema: discussionCommentWriteOutputSchema(),
+			Description: t("TOOL_DISCUSSION_COMMENT_WRITE_DESCRIPTION", `Write operations for discussion comments.
+Supports adding top-level comments, replying to existing comments, updating comment content, deleting comments, and marking or unmarking comments as the answer.`),
+			Annotations: &mcp.ToolAnnotations{
+				Title:           t("TOOL_DISCUSSION_COMMENT_WRITE_USER_TITLE", "Manage discussion comments"),
+				ReadOnlyHint:    false,
+				DestructiveHint: new(true),
+			},
+			InputSchema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"method": {
+						Type: "string",
+						Description: `Write operation to perform on a discussion comment.
+Options are:
+- 'add' - adds a new top-level comment to a discussion.
+- 'reply' - replies to a top-level discussion comment (GitHub Discussions only support one level of nesting).
+- 'update' - updates an existing discussion comment.
+- 'delete' - deletes a discussion comment.
+- 'mark_answer' - marks a discussion comment as the answer (Q&A only).
+- 'unmark_answer' - unmarks a discussion comment as the answer (Q&A only).
+`,
+						Enum: []any{"add", "reply", "update", "delete", "mark_answer", "unmark_answer"},
+					},
+					"owner": {
+						Type:        "string",
+						Description: "Repository owner (required for 'add' and 'reply' methods)",
+					},
+					"repo": {
+						Type:        "string",
+						Description: "Repository name (required for 'add' and 'reply' methods)",
+					},
+					"discussionNumber": {
+						Type:        "number",
+						Description: "Discussion number (required for 'add' and 'reply' methods)",
+					},
+					"body": {
+						Type:        "string",
+						Description: "Comment content (required for 'add', 'reply', and 'update' methods)",
+					},
+					"commentNodeID": {
+						Type:        "string",
+						Description: "The Node ID of the discussion comment (required for 'reply', 'update', 'delete', 'mark_answer', and 'unmark_answer' methods). For 'reply', this is the top-level comment to reply to; GitHub Discussions only support one level of nesting.",
+					},
+				},
+				Required: []string{"method"},
+			},
+		},
+		scopes.RequireAll(scopes.Repo),
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, input DiscussionCommentWriteInput) (*mcp.CallToolResult, *DiscussionCommentWriteOutput, error) {
+			args, err := discussionNotificationArguments(input)
+			if err != nil {
+				return nil, nil, err
+			}
+			method, err := RequiredParam[string](args, "method")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+
+			client, err := deps.GetGQLClient(ctx)
+			if err != nil {
+				return utils.NewToolResultError(fmt.Sprintf("failed to get GitHub GQL client: %v", err)), nil, nil
+			}
+
+			switch method {
+			case "add":
+				return addDiscussionComment(ctx, client, args)
+			case "reply":
+				return replyToDiscussionComment(ctx, client, args)
+			case "update":
+				return updateDiscussionComment(ctx, client, args)
+			case "delete":
+				return deleteDiscussionComment(ctx, client, args)
+			case "mark_answer":
+				return markDiscussionCommentAsAnswer(ctx, client, args)
+			case "unmark_answer":
+				return unmarkDiscussionCommentAsAnswer(ctx, client, args)
+			default:
+				return utils.NewToolResultError("invalid method, must be one of: 'add', 'reply', 'update', 'delete', 'mark_answer', 'unmark_answer'"), nil, nil
+			}
+		},
+		normalizeDiscussionCommentWriteArguments,
+	)
+}
+
+func addDiscussionComment(ctx context.Context, client *githubv4.Client, args map[string]any) (*mcp.CallToolResult, *DiscussionCommentWriteOutput, error) {
+	owner, err := RequiredParam[string](args, "owner")
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+	repo, err := RequiredParam[string](args, "repo")
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+	discussionNumber, err := RequiredInt(args, "discussionNumber")
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+	body, err := RequiredParam[string](args, "body")
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	// Get the discussion's node ID using its number
+	var q struct {
+		Repository struct {
+			Discussion struct {
+				ID githubv4.ID
+			} `graphql:"discussion(number: $discussionNumber)"`
+		} `graphql:"repository(owner: $owner, name: $repo)"`
+	}
+	vars := map[string]any{
+		"owner":            githubv4.String(owner),
+		"repo":             githubv4.String(repo),
+		"discussionNumber": githubv4.Int(discussionNumber), // #nosec G115 - discussion numbers are always small positive integers
+	}
+	if err := client.Query(ctx, &q, vars); err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	input := githubv4.AddDiscussionCommentInput{
+		DiscussionID: q.Repository.Discussion.ID,
+		Body:         githubv4.String(body),
+	}
+
+	var mutation struct {
+		AddDiscussionComment struct {
+			Comment struct {
+				ID  githubv4.ID
+				URL githubv4.String `graphql:"url"`
+			}
+		} `graphql:"addDiscussionComment(input: $input)"`
+	}
+
+	if err := client.Mutate(ctx, &mutation, input, nil); err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	comment := mutation.AddDiscussionComment.Comment
+	output := &MinimalResponse{
+		ID:  fmt.Sprintf("%v", comment.ID),
+		URL: string(comment.URL),
+	}
+	out, err := json.Marshal(output)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal comment: %w", err)
+	}
+
+	return utils.NewToolResultText(string(out)), &DiscussionCommentWriteOutput{Comment: output}, nil
+}
+
+func requiredCommentNodeID(args map[string]any) (string, error) {
+	commentNodeID, err := RequiredParam[string](args, "commentNodeID")
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(commentNodeID) == "" {
+		return "", fmt.Errorf("commentNodeID cannot be blank")
+	}
+	return commentNodeID, nil
+}
+
+func replyToDiscussionComment(ctx context.Context, client *githubv4.Client, args map[string]any) (*mcp.CallToolResult, *DiscussionCommentWriteOutput, error) {
+	commentNodeID, err := requiredCommentNodeID(args)
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	owner, err := RequiredParam[string](args, "owner")
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+	repo, err := RequiredParam[string](args, "repo")
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+	discussionNumber, err := RequiredInt(args, "discussionNumber")
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+	body, err := RequiredParam[string](args, "body")
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	// The GitHub API silently ignores an invalid ReplyToID and creates a top-level
+	// comment instead of returning an error, so we validate upfront that the node
+	// exists and is a DiscussionComment to give callers a clear failure.
+	var nodeQuery struct {
+		Node struct {
+			DiscussionComment struct {
+				ID         *githubv4.ID
+				Discussion struct {
+					ID githubv4.ID
+				} `graphql:"discussion"`
+			} `graphql:"... on DiscussionComment"`
+		} `graphql:"node(id: $replyToID)"`
+	}
+	if err := client.Query(ctx, &nodeQuery, map[string]any{
+		"replyToID": githubv4.ID(commentNodeID),
+	}); err != nil {
+		return utils.NewToolResultError(fmt.Sprintf("failed to validate commentNodeID: %v", err)), nil, nil
+	}
+	if nodeQuery.Node.DiscussionComment.ID == nil || *nodeQuery.Node.DiscussionComment.ID == "" {
+		return utils.NewToolResultError(fmt.Sprintf("commentNodeID %q does not resolve to a valid discussion comment", commentNodeID)), nil, nil
+	}
+
+	// Get the discussion's node ID using its number
+	var q struct {
+		Repository struct {
+			Discussion struct {
+				ID githubv4.ID
+			} `graphql:"discussion(number: $discussionNumber)"`
+		} `graphql:"repository(owner: $owner, name: $repo)"`
+	}
+	vars := map[string]any{
+		"owner":            githubv4.String(owner),
+		"repo":             githubv4.String(repo),
+		"discussionNumber": githubv4.Int(discussionNumber), // #nosec G115 - discussion numbers are always small positive integers
+	}
+	if err := client.Query(ctx, &q, vars); err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+	if nodeQuery.Node.DiscussionComment.Discussion.ID != q.Repository.Discussion.ID {
+		return utils.NewToolResultError(
+			fmt.Sprintf("commentNodeID %q does not belong to discussion #%d in %s/%s", commentNodeID, discussionNumber, owner, repo),
+		), nil, nil
+	}
+
+	replyToID := githubv4.ID(commentNodeID)
+	input := githubv4.AddDiscussionCommentInput{
+		DiscussionID: nodeQuery.Node.DiscussionComment.Discussion.ID,
+		Body:         githubv4.String(body),
+		ReplyToID:    &replyToID,
+	}
+
+	var mutation struct {
+		AddDiscussionComment struct {
+			Comment struct {
+				ID  githubv4.ID
+				URL githubv4.String `graphql:"url"`
+			}
+		} `graphql:"addDiscussionComment(input: $input)"`
+	}
+
+	if err := client.Mutate(ctx, &mutation, input, nil); err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	comment := mutation.AddDiscussionComment.Comment
+	output := &MinimalResponse{
+		ID:  fmt.Sprintf("%v", comment.ID),
+		URL: string(comment.URL),
+	}
+	out, err := json.Marshal(output)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal comment: %w", err)
+	}
+
+	return utils.NewToolResultText(string(out)), &DiscussionCommentWriteOutput{Comment: output}, nil
+}
+
+func updateDiscussionComment(ctx context.Context, client *githubv4.Client, args map[string]any) (*mcp.CallToolResult, *DiscussionCommentWriteOutput, error) {
+	commentNodeID, err := requiredCommentNodeID(args)
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+	body, err := RequiredParam[string](args, "body")
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	input := githubv4.UpdateDiscussionCommentInput{
+		CommentID: githubv4.ID(commentNodeID),
+		Body:      githubv4.String(body),
+	}
+
+	var mutation struct {
+		UpdateDiscussionComment struct {
+			Comment struct {
+				ID  githubv4.ID
+				URL githubv4.String `graphql:"url"`
+			}
+		} `graphql:"updateDiscussionComment(input: $input)"`
+	}
+
+	if err := client.Mutate(ctx, &mutation, input, nil); err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	comment := mutation.UpdateDiscussionComment.Comment
+	output := &MinimalResponse{
+		ID:  fmt.Sprintf("%v", comment.ID),
+		URL: string(comment.URL),
+	}
+	out, err := json.Marshal(output)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal comment: %w", err)
+	}
+
+	return utils.NewToolResultText(string(out)), &DiscussionCommentWriteOutput{Comment: output}, nil
+}
+
+func deleteDiscussionComment(ctx context.Context, client *githubv4.Client, args map[string]any) (*mcp.CallToolResult, *DiscussionCommentWriteOutput, error) {
+	commentNodeID, err := requiredCommentNodeID(args)
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	input := githubv4.DeleteDiscussionCommentInput{
+		ID: githubv4.ID(commentNodeID),
+	}
+
+	var mutation struct {
+		DeleteDiscussionComment struct {
+			Comment struct {
+				ID  githubv4.ID
+				URL githubv4.String `graphql:"url"`
+			}
+		} `graphql:"deleteDiscussionComment(input: $input)"`
+	}
+
+	if err := client.Mutate(ctx, &mutation, input, nil); err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	comment := mutation.DeleteDiscussionComment.Comment
+	output := &MinimalResponse{
+		ID:  fmt.Sprintf("%v", comment.ID),
+		URL: string(comment.URL),
+	}
+	out, err := json.Marshal(output)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal comment: %w", err)
+	}
+
+	return utils.NewToolResultText(string(out)), &DiscussionCommentWriteOutput{Comment: output}, nil
+}
+
+func markDiscussionCommentAsAnswer(ctx context.Context, client *githubv4.Client, args map[string]any) (*mcp.CallToolResult, *DiscussionCommentWriteOutput, error) {
+	commentNodeID, err := requiredCommentNodeID(args)
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	input := githubv4.MarkDiscussionCommentAsAnswerInput{
+		ID: githubv4.ID(commentNodeID),
+	}
+	var mutation struct {
+		MarkDiscussionCommentAsAnswer struct {
+			Discussion struct {
+				ID  githubv4.ID
+				URL githubv4.String `graphql:"url"`
+			}
+		} `graphql:"markDiscussionCommentAsAnswer(input: $input)"`
+	}
+	if err := client.Mutate(ctx, &mutation, input, nil); err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	output := &DiscussionAnswerOutput{
+		DiscussionID:  fmt.Sprintf("%v", mutation.MarkDiscussionCommentAsAnswer.Discussion.ID),
+		DiscussionURL: string(mutation.MarkDiscussionCommentAsAnswer.Discussion.URL),
+	}
+	out, err := json.Marshal(output)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal discussion: %w", err)
+	}
+
+	return utils.NewToolResultText(string(out)), &DiscussionCommentWriteOutput{Answer: output}, nil
+}
+
+func unmarkDiscussionCommentAsAnswer(ctx context.Context, client *githubv4.Client, args map[string]any) (*mcp.CallToolResult, *DiscussionCommentWriteOutput, error) {
+	commentNodeID, err := requiredCommentNodeID(args)
+	if err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	input := githubv4.UnmarkDiscussionCommentAsAnswerInput{
+		ID: githubv4.ID(commentNodeID),
+	}
+	var mutation struct {
+		UnmarkDiscussionCommentAsAnswer struct {
+			Discussion struct {
+				ID  githubv4.ID
+				URL githubv4.String `graphql:"url"`
+			}
+		} `graphql:"unmarkDiscussionCommentAsAnswer(input: $input)"`
+	}
+	if err := client.Mutate(ctx, &mutation, input, nil); err != nil {
+		return utils.NewToolResultError(err.Error()), nil, nil
+	}
+
+	output := &DiscussionAnswerOutput{
+		DiscussionID:  fmt.Sprintf("%v", mutation.UnmarkDiscussionCommentAsAnswer.Discussion.ID),
+		DiscussionURL: string(mutation.UnmarkDiscussionCommentAsAnswer.Discussion.URL),
+	}
+	out, err := json.Marshal(output)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal discussion: %w", err)
+	}
+
+	return utils.NewToolResultText(string(out)), &DiscussionCommentWriteOutput{Answer: output}, nil
+}
+
+func ListDiscussionCategories(t translations.TranslationHelperFunc) inventory.ServerTool {
+	return NewTool[ListDiscussionCategoriesInput, *DiscussionCategoriesOutput](
+		ToolsetMetadataDiscussions,
+		mcp.Tool{
+			Name:         "list_discussion_categories",
+			OutputSchema: discussionNotificationOutputSchema[DiscussionCategoriesOutput](),
+			Description:  t("TOOL_LIST_DISCUSSION_CATEGORIES_DESCRIPTION", "List discussion categories with their id and name, for a repository or organisation."),
 			Annotations: &mcp.ToolAnnotations{
 				Title:        t("TOOL_LIST_DISCUSSION_CATEGORIES_USER_TITLE", "List discussion categories"),
 				ReadOnlyHint: true,
@@ -532,8 +1050,12 @@ func ListDiscussionCategories(t translations.TranslationHelperFunc) inventory.Se
 				Required: []string{"owner"},
 			},
 		},
-		[]scopes.Scope{scopes.Repo},
-		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+		scopes.PublicRead(scopes.Repo),
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, input ListDiscussionCategoriesInput) (*mcp.CallToolResult, *DiscussionCategoriesOutput, error) {
+			args, err := discussionNotificationArguments(input)
+			if err != nil {
+				return nil, nil, err
+			}
 			owner, err := RequiredParam[string](args, "owner")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
@@ -603,7 +1125,24 @@ func ListDiscussionCategories(t translations.TranslationHelperFunc) inventory.Se
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to marshal discussion categories: %w", err)
 			}
-			return utils.NewToolResultText(string(out)), nil, nil
+			result := utils.NewToolResultText(string(out))
+			// Discussion categories are repo-defined structural metadata
+			// (trusted); confidentiality follows repo visibility.
+			result = attachRepoVisibilityIFCLabelLazy(ctx, deps, owner, repo, result, ifc.LabelRepoMetadata)
+			items := make([]DiscussionCategoryItemOutput, 0, len(categories))
+			for _, category := range categories {
+				items = append(items, DiscussionCategoryItemOutput{ID: category["id"], Name: category["name"]})
+			}
+			return result, &DiscussionCategoriesOutput{
+				Categories: items,
+				PageInfo: DiscussionPageInfoOutput{
+					HasNextPage:     bool(q.Repository.DiscussionCategories.PageInfo.HasNextPage),
+					HasPreviousPage: bool(q.Repository.DiscussionCategories.PageInfo.HasPreviousPage),
+					StartCursor:     string(q.Repository.DiscussionCategories.PageInfo.StartCursor),
+					EndCursor:       string(q.Repository.DiscussionCategories.PageInfo.EndCursor),
+				},
+				TotalCount: q.Repository.DiscussionCategories.TotalCount,
+			}, nil
 		},
 	)
 }

@@ -48,7 +48,6 @@ type Builder struct {
 	featureChecker       FeatureFlagChecker
 	filters              []ToolFilter // filters to apply to all tools
 	generateInstructions bool
-	insidersMode         bool
 }
 
 // NewBuilder creates a new Builder.
@@ -61,19 +60,19 @@ func NewBuilder() *Builder {
 
 // SetTools sets the tools for the inventory. Returns self for chaining.
 func (b *Builder) SetTools(tools []ServerTool) *Builder {
-	b.tools = tools
+	b.tools = slices.Clone(tools)
 	return b
 }
 
 // SetResources sets the resource templates for the inventory. Returns self for chaining.
 func (b *Builder) SetResources(resources []ServerResourceTemplate) *Builder {
-	b.resourceTemplates = resources
+	b.resourceTemplates = slices.Clone(resources)
 	return b
 }
 
 // SetPrompts sets the prompts for the inventory. Returns self for chaining.
 func (b *Builder) SetPrompts(prompts []ServerPrompt) *Builder {
-	b.prompts = prompts
+	b.prompts = slices.Clone(prompts)
 	return b
 }
 
@@ -102,8 +101,7 @@ func (b *Builder) WithServerInstructions() *Builder {
 //   - "default": expands to toolsets marked with Default: true in their metadata
 //
 // Input strings are trimmed of whitespace and duplicates are removed.
-// Pass nil to use default toolsets. Pass an empty slice to disable all toolsets
-// (useful for dynamic toolsets mode where tools are enabled on demand).
+// Pass nil to use default toolsets. Pass an empty slice to disable all toolsets.
 // Returns self for chaining.
 func (b *Builder) WithToolsets(toolsetIDs []string) *Builder {
 	b.toolsetIDs = toolsetIDs
@@ -122,10 +120,17 @@ func (b *Builder) WithTools(toolNames []string) *Builder {
 	return b
 }
 
-// WithFeatureChecker sets the feature flag checker function.
-// The checker receives a context (for actor extraction) and feature flag name,
-// returns (enabled, error). If error occurs, it will be logged and treated as false.
-// If checker is nil, all feature flag checks return false.
+// WithFeatureChecker sets the feature flag checker function. Inventory items
+// declare their feature dependencies and functional availability rules through
+// FeatureRule. Checks are deduplicated into request-owned resolution state;
+// errors are logged and treated as disabled.
+//
+// When the checker is nil, no feature-flag filter is installed; tools,
+// resources, and prompts pass through feature-flag gating unchanged. The
+// per-request inventory in HTTP mode must always install a checker so that
+// MCP registration (which can only serve a given tool name once) sees a
+// deduplicated set of dual-name variants.
+//
 // Returns self for chaining.
 func (b *Builder) WithFeatureChecker(checker FeatureFlagChecker) *Builder {
 	b.featureChecker = checker
@@ -151,15 +156,6 @@ func (b *Builder) WithExcludeTools(toolNames []string) *Builder {
 	if len(cleaned) > 0 {
 		b.filters = append(b.filters, CreateExcludeToolsFilter(cleaned))
 	}
-	return b
-}
-
-// WithInsidersMode enables or disables insiders mode features.
-// When insiders mode is disabled (default), UI metadata is removed from tools
-// so clients won't attempt to load UI resources.
-// Returns self for chaining.
-func (b *Builder) WithInsidersMode(enabled bool) *Builder {
-	b.insidersMode = enabled
 	return b
 }
 
@@ -204,11 +200,9 @@ func cleanTools(tools []string) []string {
 // (i.e., they don't exist in the tool set and are not deprecated aliases).
 // This ensures invalid tool configurations fail fast at build time.
 func (b *Builder) Build() (*Inventory, error) {
-	// When insiders mode is disabled, strip insiders-only features from tools
 	tools := b.tools
-	if !b.insidersMode {
-		tools = stripInsidersFeatures(b.tools)
-	}
+
+	filters := b.filters
 
 	r := &Inventory{
 		tools:             tools,
@@ -217,7 +211,7 @@ func (b *Builder) Build() (*Inventory, error) {
 		deprecatedAliases: b.deprecatedAliases,
 		readOnly:          b.readOnly,
 		featureChecker:    b.featureChecker,
-		filters:           b.filters,
+		filters:           filters,
 	}
 
 	// Process toolsets and pre-compute metadata in a single pass
@@ -375,24 +369,22 @@ func (b *Builder) processToolsets() (map[ToolsetID]bool, []string, []ToolsetID, 
 	return enabledToolsets, unrecognized, allToolsetIDs, validIDs, defaultToolsetIDList, descriptions
 }
 
-// insidersOnlyMetaKeys lists the Meta keys that are only available in insiders mode.
-// Add new experimental feature keys here to have them automatically stripped
-// when insiders mode is disabled.
-var insidersOnlyMetaKeys = []string{
+// mcpAppsMetaKeys lists the Meta keys that carry MCP Apps UI metadata.
+var mcpAppsMetaKeys = []string{
 	"ui", // MCP Apps UI metadata
 }
 
-// stripInsidersFeatures removes insiders-only features from tools.
-// This includes removing tools marked with InsidersOnly and stripping
-// Meta keys listed in insidersOnlyMetaKeys from remaining tools.
-func stripInsidersFeatures(tools []ServerTool) []ServerTool {
+// stripMCPAppsMetadata removes MCP Apps UI metadata from tools when the
+// client does not support MCP Apps UI. App-only tools (ui.visibility without
+// "model") are omitted entirely rather than being exposed as ordinary
+// model-visible tools.
+func stripMCPAppsMetadata(tools []ServerTool) []ServerTool {
 	result := make([]ServerTool, 0, len(tools))
 	for _, tool := range tools {
-		// Skip tools marked as insiders-only
-		if tool.InsidersOnly {
+		if isAppOnlyTool(&tool) {
 			continue
 		}
-		if stripped := stripInsidersMetaFromTool(tool); stripped != nil {
+		if stripped := stripMetaKeys(tool, mcpAppsMetaKeys); stripped != nil {
 			result = append(result, *stripped)
 		} else {
 			result = append(result, tool)
@@ -401,30 +393,54 @@ func stripInsidersFeatures(tools []ServerTool) []ServerTool {
 	return result
 }
 
-// stripInsidersMetaFromTool removes insiders-only Meta keys from a single tool.
+// isAppOnlyTool reports whether a tool declares MCP Apps visibility that
+// excludes the model (e.g. `_meta.ui.visibility: ["app"]`). Such tools are
+// only meant to be called by MCP App views, never by the model directly.
+func isAppOnlyTool(tool *ServerTool) bool {
+	ui, ok := tool.Tool.Meta["ui"].(map[string]any)
+	if !ok {
+		return false
+	}
+	var visibility []string
+	switch v := ui["visibility"].(type) {
+	case []string:
+		visibility = v
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				visibility = append(visibility, s)
+			}
+		}
+	default:
+		return false
+	}
+	return len(visibility) > 0 && !slices.Contains(visibility, "model")
+}
+
+// stripMetaKeys removes the specified Meta keys from a single tool.
 // Returns a modified copy if changes were made, nil otherwise.
-func stripInsidersMetaFromTool(tool ServerTool) *ServerTool {
-	if tool.Tool.Meta == nil {
+func stripMetaKeys(tool ServerTool, keys []string) *ServerTool {
+	if tool.Tool.Meta == nil || len(keys) == 0 {
 		return nil
 	}
 
-	// Check if any insiders-only keys exist
-	hasInsidersKeys := false
-	for _, key := range insidersOnlyMetaKeys {
-		if tool.Tool.Meta[key] != nil {
-			hasInsidersKeys = true
+	// Check if any of the specified keys exist
+	hasKeys := false
+	for _, key := range keys {
+		if _, ok := tool.Tool.Meta[key]; ok {
+			hasKeys = true
 			break
 		}
 	}
-	if !hasInsidersKeys {
+	if !hasKeys {
 		return nil
 	}
 
-	// Make a shallow copy and remove insiders-only keys
+	// Make a shallow copy and remove specified keys
 	toolCopy := tool
 	newMeta := make(map[string]any, len(tool.Tool.Meta))
 	for k, v := range tool.Tool.Meta {
-		if !slices.Contains(insidersOnlyMetaKeys, k) {
+		if !slices.Contains(keys, k) {
 			newMeta[k] = v
 		}
 	}

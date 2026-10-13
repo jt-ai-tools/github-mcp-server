@@ -11,10 +11,11 @@ We currently support the following ways in which the GitHub MCP Server can be co
 | Individual Tools | `X-MCP-Tools` header | `--tools` flag or `GITHUB_TOOLS` env var |
 | Exclude Tools | `X-MCP-Exclude-Tools` header | `--exclude-tools` flag or `GITHUB_EXCLUDE_TOOLS` env var |
 | Read-Only Mode | `X-MCP-Readonly` header or `/readonly` URL | `--read-only` flag or `GITHUB_READ_ONLY` env var |
-| Dynamic Mode | Not available | `--dynamic-toolsets` flag or `GITHUB_DYNAMIC_TOOLSETS` env var |
 | Lockdown Mode | `X-MCP-Lockdown` header | `--lockdown-mode` flag or `GITHUB_LOCKDOWN_MODE` env var |
 | Insiders Mode | `X-MCP-Insiders` header or `/insiders` URL | `--insiders` flag or `GITHUB_INSIDERS` env var |
+| Feature Flags | `X-MCP-Features` header or `?features=` URL query parameter | `--features` flag |
 | Scope Filtering | Always enabled | Always enabled |
+| Server Name/Title | Not available | `GITHUB_MCP_SERVER_NAME` / `GITHUB_MCP_SERVER_TITLE` env vars or `github-mcp-server-config.json` |
 
 > **Default behavior:** If you don't specify any configuration, the server uses the **default toolsets**: `context`, `issues`, `pull_requests`, `repos`, `users`.
 
@@ -22,11 +23,13 @@ We currently support the following ways in which the GitHub MCP Server can be co
 
 ## How Configuration Works
 
-All configuration options are **composable**: you can combine toolsets, individual tools, excluded tools, dynamic discovery, read-only mode and lockdown mode in any way that suits your workflow.
+All configuration options are **composable**: you can combine toolsets, individual tools, excluded tools, read-only mode and lockdown mode in any way that suits your workflow.
 
 Note: **read-only** mode acts as a strict security filter that takes precedence over any other configuration, by disabling write tools even when explicitly requested.
 
 Note: **excluded tools** takes precedence over toolsets and individual tools — listed tools are always excluded, even if their toolset is enabled or they are explicitly added via `--tools` / `X-MCP-Tools`.
+
+Note: server-side **lockdown mode** (`--lockdown-mode` / `GITHUB_LOCKDOWN_MODE`) is an upper bound in HTTP mode — once an operator enables it, the `X-MCP-Lockdown` header can no longer disable it for a given request. A request may still use the header to enable lockdown mode for itself when the operator has not already enabled it server-wide, but it can never relax lockdown mode below what the operator configured. Lockdown mode remains a best-effort content filter, not a security boundary.
 
 ---
 
@@ -285,64 +288,17 @@ When active, this mode will disable all tools that are not read-only even if the
 
 ---
 
-### Dynamic Discovery (Local Only)
-
-**Best for:** Letting the LLM discover and enable toolsets as needed.
-
-Starts with only discovery tools (`enable_toolset`, `list_available_toolsets`, `get_toolset_tools`), then expands on demand.
-
-<table>
-<tr><th>Local Server Only</th></tr>
-<tr valign="top">
-<td>
-
-```json
-{
-  "type": "stdio",
-  "command": "go",
-  "args": [
-    "run",
-    "./cmd/github-mcp-server",
-    "stdio",
-    "--dynamic-toolsets"
-  ],
-  "env": {
-    "GITHUB_PERSONAL_ACCESS_TOKEN": "${input:github_token}"
-  }
-}
-```
-
-**With some tools pre-enabled:**
-```json
-{
-  "type": "stdio",
-  "command": "go",
-  "args": [
-    "run",
-    "./cmd/github-mcp-server",
-    "stdio",
-    "--dynamic-toolsets",
-    "--tools=get_me,search_code"
-  ],
-  "env": {
-    "GITHUB_PERSONAL_ACCESS_TOKEN": "${input:github_token}"
-  }
-}
-```
-
-</td>
-</tr>
-</table>
-
-When both dynamic mode and specific tools are enabled in the server configuration, the server will start with the 3 dynamic tools + the specified tools.
-
----
-
 ### Lockdown Mode
 
 **Best for:** Public repositories where you want to limit content from users without push access.
 
 Lockdown mode ensures the server only surfaces content in public repositories from users with push access to that repository. Private repositories are unaffected, and collaborators retain full access to their own content.
+
+> In HTTP mode, server-side lockdown mode (`--lockdown-mode` / `GITHUB_LOCKDOWN_MODE`) is an upper bound: the `X-MCP-Lockdown` header can enable lockdown mode for a request when the operator has not enabled it server-wide, but it cannot disable lockdown mode the operator has already enabled.
+
+Lockdown mode is a best-effort content filter meant to reduce prompt-injection risk from untrusted repository content; it is not an authorization boundary. It does not restrict what the underlying credential can otherwise read or write, and content withheld from a filtered tool response may still be reachable through other tools or direct GitHub API access with the same credential.
+
+As an intentional exception, content authored by trusted bot accounts (currently `github-actions[bot]` and `copilot`) is always treated as safe, regardless of push access, so routine automation output isn't filtered.
 
 **Example:**
 <table>
@@ -389,7 +345,7 @@ Lockdown mode ensures the server only surfaces content in public repositories fr
 
 **Best for:** Users who want early access to experimental features and new tools before they reach general availability.
 
-Insiders Mode unlocks experimental features, such as [MCP Apps](./insiders-features.md#mcp-apps) support. We created this mode to have a way to roll out experimental features and collect feedback. So if you are using Insiders, please don't hesitate to share your feedback with us! Features in Insiders Mode may change, evolve, or be removed based on user feedback. 
+Insiders Mode unlocks experimental features, such as [CSV output for list tools](./insiders-features.md#csv-output-for-list-tools). We created this mode to have a way to roll out experimental features and collect feedback. So if you are using Insiders, please don't hesitate to share your feedback with us! Features in Insiders Mode may change, evolve, or be removed based on user feedback.
 
 <table>
 <tr><th>Remote Server</th><th>Local Server</th></tr>
@@ -442,6 +398,36 @@ See [Insiders Features](./insiders-features.md) for a full list of what's availa
 
 ---
 
+### MCP Apps
+
+[MCP Apps](https://modelcontextprotocol.io/docs/extensions/apps) is an extension to the Model Context Protocol that enables servers to deliver interactive user interfaces to end users. Instead of returning plain text that the LLM must interpret and relay, tools can render forms, profiles, and dashboards right in the chat.
+
+MCP Apps is enabled by default. Tools with MCP Apps UIs advertise them via `_meta.ui` to clients that support the [MCP Apps extension](https://modelcontextprotocol.io/docs/extensions/apps); the metadata is omitted for clients that do not advertise the `io.modelcontextprotocol/ui` capability.
+
+To keep MCP App result views enabled while making write tools execute directly
+instead of first opening an interactive form, enable the
+`mcp_apps_disable_form_deferral` feature flag. For the remote server, send the
+flag in the request header:
+
+```http
+X-MCP-Features: mcp_apps_disable_form_deferral
+```
+
+For the local server, pass it to `--features`.
+
+**Supported tools:**
+
+| Tool | Description |
+|------|-------------|
+| `get_me` | Displays your GitHub user profile with avatar, bio, and stats in a rich card |
+| `issue_write` | Opens an interactive form to create or update issues |
+| `create_pull_request` | Provides a full PR creation form to create a pull request (or a draft pull request) |
+| `update_pull_request` | Opens an interactive form to edit a pull request |
+
+**Client requirements:** MCP Apps requires a host that supports the [MCP Apps extension](https://modelcontextprotocol.io/docs/extensions/apps). Currently tested with VS Code (`chat.mcp.apps.enabled` setting).
+
+---
+
 ### Scope Filtering
 
 **Automatic feature:** The server handles OAuth scopes differently depending on authentication type:
@@ -463,7 +449,6 @@ See [Scope Filtering](./scope-filtering.md) for details on how filtering works w
 | Server fails to start | Invalid tool name in `--tools` or `X-MCP-Tools` | Check tool name spelling; use exact names from [Tools list](../README.md#tools) |
 | Write tools not working | Read-only mode enabled | Remove `--read-only` flag or `X-MCP-Readonly` header |
 | Tools missing | Toolset not enabled | Add the required toolset or specific tool |
-| Dynamic tools not available | Using remote server | Dynamic mode is available in the local MCP server only |
 
 ---
 

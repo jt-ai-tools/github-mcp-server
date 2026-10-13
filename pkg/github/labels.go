@@ -6,25 +6,35 @@ import (
 	"fmt"
 	"strings"
 
-	ghErrors "github.com/github/github-mcp-server/pkg/errors"
-	"github.com/github/github-mcp-server/pkg/inventory"
-	"github.com/github/github-mcp-server/pkg/scopes"
-	"github.com/github/github-mcp-server/pkg/translations"
-	"github.com/github/github-mcp-server/pkg/utils"
+	ghErrors "github.com/github/github-mcp-server/v2/pkg/errors"
+	"github.com/github/github-mcp-server/v2/pkg/ifc"
+	"github.com/github/github-mcp-server/v2/pkg/inventory"
+	"github.com/github/github-mcp-server/v2/pkg/scopes"
+	"github.com/github/github-mcp-server/v2/pkg/translations"
+	"github.com/github/github-mcp-server/v2/pkg/utils"
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/shurcooL/githubv4"
 )
 
+// labelOrderFieldIssueCount orders labels by the number of issues they are assigned to.
+// It is not part of the githubv4.LabelOrderField constants shipped with the client library
+// (or GitHub's public GraphQL schema docs), but the API accepts it, so we define it locally.
+const labelOrderFieldIssueCount githubv4.LabelOrderField = "ISSUE_COUNT"
+
 // GetLabel retrieves a specific label by name from a GitHub repository
 func GetLabel(t translations.TranslationHelperFunc) inventory.ServerTool {
+	return typedGovernanceTool(getLabelLegacy(t), labelOutputSchema(), decodeGovernanceJSON[MinimalLabel])
+}
+
+func getLabelLegacy(t translations.TranslationHelperFunc) inventory.ServerTool {
 	return NewTool(
 		ToolsetMetadataIssues,
 		mcp.Tool{
 			Name:        "get_label",
 			Description: t("TOOL_GET_LABEL_DESCRIPTION", "Get a specific label from a repository."),
 			Annotations: &mcp.ToolAnnotations{
-				Title:        t("TOOL_GET_LABEL_TITLE", "Get a specific label from a repository."),
+				Title:        t("TOOL_GET_LABEL_TITLE", "Get a specific label from a repository"),
 				ReadOnlyHint: true,
 			},
 			InputSchema: &jsonschema.Schema{
@@ -46,7 +56,7 @@ func GetLabel(t translations.TranslationHelperFunc) inventory.ServerTool {
 				Required: []string{"owner", "repo", "name"},
 			},
 		},
-		[]scopes.Scope{scopes.Repo},
+		scopes.PublicRead(scopes.Repo),
 		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
 			owner, err := RequiredParam[string](args, "owner")
 			if err != nil {
@@ -105,7 +115,11 @@ func GetLabel(t translations.TranslationHelperFunc) inventory.ServerTool {
 				return nil, nil, fmt.Errorf("failed to marshal label: %w", err)
 			}
 
-			return utils.NewToolResultText(string(out)), nil, nil
+			result := utils.NewToolResultText(string(out))
+			// Labels are structural repo metadata defined by collaborators
+			// (trusted); confidentiality follows repo visibility.
+			result = attachRepoVisibilityIFCLabelLazy(ctx, deps, owner, repo, result, ifc.LabelRepoMetadata)
+			return result, nil, nil
 		},
 	)
 }
@@ -120,13 +134,17 @@ func GetLabelForLabelsToolset(t translations.TranslationHelperFunc) inventory.Se
 
 // ListLabels lists labels from a repository
 func ListLabels(t translations.TranslationHelperFunc) inventory.ServerTool {
+	return typedGovernanceTool(listLabelsLegacy(t), listLabelsOutputSchema(), decodeGovernanceJSON[ListLabelsOutput])
+}
+
+func listLabelsLegacy(t translations.TranslationHelperFunc) inventory.ServerTool {
 	return NewTool(
 		ToolsetLabels,
 		mcp.Tool{
 			Name:        "list_label",
-			Description: t("TOOL_LIST_LABEL_DESCRIPTION", "List labels from a repository"),
+			Description: t("TOOL_LIST_LABEL_DESCRIPTION", "List labels from a repository, ordered by issue count (descending) so the most-used labels are returned first"),
 			Annotations: &mcp.ToolAnnotations{
-				Title:        t("TOOL_LIST_LABEL_DESCRIPTION", "List labels from a repository."),
+				Title:        t("TOOL_LIST_LABEL_TITLE", "List labels from a repository"),
 				ReadOnlyHint: true,
 			},
 			InputSchema: &jsonschema.Schema{
@@ -144,7 +162,7 @@ func ListLabels(t translations.TranslationHelperFunc) inventory.ServerTool {
 				Required: []string{"owner", "repo"},
 			},
 		},
-		[]scopes.Scope{scopes.Repo},
+		scopes.PublicRead(scopes.Repo),
 		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
 			owner, err := RequiredParam[string](args, "owner")
 			if err != nil {
@@ -171,13 +189,16 @@ func ListLabels(t translations.TranslationHelperFunc) inventory.ServerTool {
 							Description githubv4.String
 						}
 						TotalCount githubv4.Int
-					} `graphql:"labels(first: 100)"`
+					} `graphql:"labels(first: 100, orderBy: {field: $orderByField, direction: $orderByDirection})"`
 				} `graphql:"repository(owner: $owner, name: $repo)"`
 			}
 
 			vars := map[string]any{
 				"owner": githubv4.String(owner),
 				"repo":  githubv4.String(repo),
+				// Order labels by issue count (descending) so the most-used labels are returned first.
+				"orderByField":     labelOrderFieldIssueCount,
+				"orderByDirection": githubv4.OrderDirectionDesc,
 			}
 
 			if err := client.Query(ctx, &query, vars); err != nil {
@@ -204,21 +225,32 @@ func ListLabels(t translations.TranslationHelperFunc) inventory.ServerTool {
 				return nil, nil, fmt.Errorf("failed to marshal labels: %w", err)
 			}
 
-			return utils.NewToolResultText(string(out)), nil, nil
+			result := utils.NewToolResultText(string(out))
+			// Labels are structural repo metadata defined by collaborators
+			// (trusted); confidentiality follows repo visibility.
+			result = attachRepoVisibilityIFCLabelLazy(ctx, deps, owner, repo, result, ifc.LabelRepoMetadata)
+			return result, nil, nil
 		},
 	)
 }
 
 // LabelWrite handles create, update, and delete operations for GitHub labels
 func LabelWrite(t translations.TranslationHelperFunc) inventory.ServerTool {
+	return typedGovernanceTool(labelWriteLegacy(t), labelWriteOutputSchema(), func(raw []byte, args map[string]json.RawMessage) (LabelWriteOutput, error) {
+		return LabelWriteOutput{Method: strings.ToLower(governanceArgument(args, "method")), Message: string(raw)}, nil
+	})
+}
+
+func labelWriteLegacy(t translations.TranslationHelperFunc) inventory.ServerTool {
 	return NewTool(
 		ToolsetLabels,
 		mcp.Tool{
 			Name:        "label_write",
 			Description: t("TOOL_LABEL_WRITE_DESCRIPTION", "Perform write operations on repository labels. To set labels on issues, use the 'update_issue' tool."),
 			Annotations: &mcp.ToolAnnotations{
-				Title:        t("TOOL_LABEL_WRITE_TITLE", "Write operations on repository labels."),
-				ReadOnlyHint: false,
+				Title:           t("TOOL_LABEL_WRITE_TITLE", "Write operations on repository labels"),
+				ReadOnlyHint:    false,
+				DestructiveHint: new(true),
 			},
 			InputSchema: &jsonschema.Schema{
 				Type: "object",
@@ -256,7 +288,7 @@ func LabelWrite(t translations.TranslationHelperFunc) inventory.ServerTool {
 				Required: []string{"method", "owner", "repo", "name"},
 			},
 		},
-		[]scopes.Scope{scopes.Repo},
+		scopes.RequireAll(scopes.Repo),
 		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
 			// Get and validate required parameters
 			method, err := RequiredParam[string](args, "method")

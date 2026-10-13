@@ -6,7 +6,7 @@ import (
 	"math"
 	"strconv"
 
-	"github.com/google/go-github/v82/github"
+	"github.com/google/go-github/v92/github"
 	"github.com/google/jsonschema-go/jsonschema"
 )
 
@@ -32,6 +32,26 @@ func OptionalParamOK[T any, A map[string]any](args A, p string) (value T, ok boo
 	// Present and correct type
 	ok = true
 	return
+}
+
+// OptionalNullableStringParam preserves omitted, null, and non-empty string values.
+func OptionalNullableStringParam(args map[string]any, p string) (*string, bool, error) {
+	value, ok := args[p]
+	if !ok {
+		return nil, false, nil
+	}
+	if value == nil {
+		return nil, true, nil
+	}
+
+	stringValue, ok := value.(string)
+	if !ok {
+		return nil, true, fmt.Errorf("parameter %s is not of type string or null, is %T", p, value)
+	}
+	if stringValue == "" {
+		return nil, true, fmt.Errorf("parameter %s must not be empty", p)
+	}
+	return &stringValue, true, nil
 }
 
 // isAcceptedError checks if the error is an accepted error.
@@ -328,14 +348,14 @@ func WithPagination(schema *jsonschema.Schema) *jsonschema.Schema {
 	schema.Properties["page"] = &jsonschema.Schema{
 		Type:        "number",
 		Description: "Page number for pagination (min 1)",
-		Minimum:     jsonschema.Ptr(1.0),
+		Minimum:     new(1.0),
 	}
 
 	schema.Properties["perPage"] = &jsonschema.Schema{
 		Type:        "number",
 		Description: "Results per page for pagination (min 1, max 100)",
-		Minimum:     jsonschema.Ptr(1.0),
-		Maximum:     jsonschema.Ptr(100.0),
+		Minimum:     new(1.0),
+		Maximum:     new(100.0),
 	}
 
 	return schema
@@ -347,14 +367,14 @@ func WithUnifiedPagination(schema *jsonschema.Schema) *jsonschema.Schema {
 	schema.Properties["page"] = &jsonschema.Schema{
 		Type:        "number",
 		Description: "Page number for pagination (min 1)",
-		Minimum:     jsonschema.Ptr(1.0),
+		Minimum:     new(1.0),
 	}
 
 	schema.Properties["perPage"] = &jsonschema.Schema{
 		Type:        "number",
 		Description: "Results per page for pagination (min 1, max 100)",
-		Minimum:     jsonschema.Ptr(1.0),
-		Maximum:     jsonschema.Ptr(100.0),
+		Minimum:     new(1.0),
+		Maximum:     new(100.0),
 	}
 
 	schema.Properties["after"] = &jsonschema.Schema{
@@ -370,13 +390,13 @@ func WithCursorPagination(schema *jsonschema.Schema) *jsonschema.Schema {
 	schema.Properties["perPage"] = &jsonschema.Schema{
 		Type:        "number",
 		Description: "Results per page for pagination (min 1, max 100)",
-		Minimum:     jsonschema.Ptr(1.0),
-		Maximum:     jsonschema.Ptr(100.0),
+		Minimum:     new(1.0),
+		Maximum:     new(100.0),
 	}
 
 	schema.Properties["after"] = &jsonschema.Schema{
 		Type:        "string",
-		Description: "Cursor for pagination. Use the endCursor from the previous page's PageInfo for GraphQL APIs.",
+		Description: "Cursor for pagination. Use the cursor from the previous response.",
 	}
 
 	return schema
@@ -433,6 +453,22 @@ func OptionalCursorPaginationParams(args map[string]any) (CursorPaginationParams
 type CursorPaginationParams struct {
 	PerPage int
 	After   string
+}
+
+type pageInfo struct {
+	HasNextPage     bool   `json:"hasNextPage"`
+	HasPreviousPage bool   `json:"hasPreviousPage"`
+	NextCursor      string `json:"nextCursor,omitempty"`
+	PrevCursor      string `json:"prevCursor,omitempty"`
+}
+
+func buildPageInfo(resp *github.Response) pageInfo {
+	return pageInfo{
+		HasNextPage:     resp.After != "",
+		HasPreviousPage: resp.Before != "",
+		NextCursor:      resp.After,
+		PrevCursor:      resp.Before,
+	}
 }
 
 // ToGraphQLParams converts cursor pagination parameters to GraphQL-specific parameters.

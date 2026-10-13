@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
+	"time"
 
+	ghcontext "github.com/github/github-mcp-server/v2/pkg/context"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
 )
@@ -38,7 +40,7 @@ func testToolsetMetadataWithDefault(id string, isDefault bool) ToolsetMetadata {
 
 // mockToolWithDefault creates a mock tool with a default toolset flag
 func mockToolWithDefault(name string, toolsetID string, readOnly bool, isDefault bool) ServerTool {
-	return NewServerToolFromHandler(
+	return NewServerTool(
 		mcp.Tool{
 			Name: name,
 			Annotations: &mcp.ToolAnnotations{
@@ -47,17 +49,15 @@ func mockToolWithDefault(name string, toolsetID string, readOnly bool, isDefault
 			InputSchema: json.RawMessage(`{"type":"object","properties":{}}`),
 		},
 		testToolsetMetadataWithDefault(toolsetID, isDefault),
-		func(_ any) mcp.ToolHandler {
-			return func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-				return nil, nil
-			}
+		func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return nil, nil
 		},
 	)
 }
 
 // mockTool creates a minimal ServerTool for testing
 func mockTool(name string, toolsetID string, readOnly bool) ServerTool {
-	return NewServerToolFromHandler(
+	return NewServerTool(
 		mcp.Tool{
 			Name: name,
 			Annotations: &mcp.ToolAnnotations{
@@ -66,10 +66,8 @@ func mockTool(name string, toolsetID string, readOnly bool) ServerTool {
 			InputSchema: json.RawMessage(`{"type":"object","properties":{}}`),
 		},
 		testToolsetMetadata(toolsetID),
-		func(_ any) mcp.ToolHandler {
-			return func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-				return nil, nil
-			}
+		func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return nil, nil
 		},
 	)
 }
@@ -466,21 +464,6 @@ func TestToolsetDescriptions(t *testing.T) {
 	}
 }
 
-func TestToolsForToolset(t *testing.T) {
-	tools := []ServerTool{
-		mockTool("tool1", "toolset1", true),
-		mockTool("tool2", "toolset1", true),
-		mockTool("tool3", "toolset2", true),
-	}
-
-	reg := mustBuild(t, NewBuilder().SetTools(tools))
-	toolset1Tools := reg.ToolsForToolset("toolset1")
-
-	if len(toolset1Tools) != 2 {
-		t.Fatalf("Expected 2 tools for toolset1, got %d", len(toolset1Tools))
-	}
-}
-
 func TestWithDeprecatedAliases(t *testing.T) {
 	tools := []ServerTool{
 		mockTool("new_name", "toolset1", true),
@@ -639,30 +622,6 @@ func TestHasToolset(t *testing.T) {
 	}
 	if reg.HasToolset("nonexistent") {
 		t.Error("expected HasToolset to return false for non-existent toolset")
-	}
-}
-
-func TestEnabledToolsetIDs(t *testing.T) {
-	tools := []ServerTool{
-		mockTool("tool1", "toolset1", true),
-		mockTool("tool2", "toolset2", true),
-	}
-
-	// Without filter, all toolsets are enabled
-	reg := mustBuild(t, NewBuilder().SetTools(tools).WithToolsets([]string{"all"}))
-	ids := reg.EnabledToolsetIDs()
-	if len(ids) != 2 {
-		t.Fatalf("Expected 2 enabled toolset IDs, got %d", len(ids))
-	}
-
-	// With filter
-	filtered := mustBuild(t, NewBuilder().SetTools(tools).WithToolsets([]string{"toolset1"}))
-	filteredIDs := filtered.EnabledToolsetIDs()
-	if len(filteredIDs) != 1 {
-		t.Fatalf("Expected 1 enabled toolset ID, got %d", len(filteredIDs))
-	}
-	if filteredIDs[0] != "toolset1" {
-		t.Errorf("Expected toolset1, got %s", filteredIDs[0])
 	}
 }
 
@@ -1086,11 +1045,20 @@ func TestMCPMethodConstants(t *testing.T) {
 	}
 }
 
-// mockToolWithFlags creates a ServerTool with feature flags for testing
+// mockToolWithFlags creates a ServerTool with a functional feature rule for testing.
 func mockToolWithFlags(name string, toolsetID string, readOnly bool, enableFlag, disableFlag string) ServerTool {
 	tool := mockTool(name, toolsetID, readOnly)
-	tool.FeatureFlagEnable = enableFlag
-	tool.FeatureFlagDisable = disableFlag
+	features := make([]FeatureFlag, 0, 2)
+	if enableFlag != "" {
+		features = append(features, FeatureFlag(enableFlag))
+	}
+	if disableFlag != "" {
+		features = append(features, FeatureFlag(disableFlag))
+	}
+	tool.FeatureRule = NewFeatureRule(features, func(featureAsBool FeatureResolver) bool {
+		return (enableFlag == "" || featureAsBool(FeatureFlag(enableFlag))) &&
+			(disableFlag == "" || !featureAsBool(FeatureFlag(disableFlag)))
+	})
 	return tool
 }
 
@@ -1100,22 +1068,22 @@ func TestFeatureFlagEnable(t *testing.T) {
 		mockToolWithFlags("needs_flag", "toolset1", true, "my_feature", ""),
 	}
 
-	// Without feature checker, tool with FeatureFlagEnable should be excluded
+	// Without feature checker, feature-flag filtering is skipped: both tools pass
 	reg := mustBuild(t, NewBuilder().SetTools(tools).WithToolsets([]string{"all"}))
 	available := reg.AvailableTools(context.Background())
-	if len(available) != 1 {
-		t.Fatalf("Expected 1 tool without feature checker, got %d", len(available))
-	}
-	if available[0].Tool.Name != "always_available" {
-		t.Errorf("Expected always_available, got %s", available[0].Tool.Name)
+	if len(available) != 2 {
+		t.Fatalf("Expected 2 tools without feature checker (filtering skipped), got %d", len(available))
 	}
 
-	// With feature checker returning false, tool should still be excluded
+	// With feature checker returning false, the feature-gated tool is excluded.
 	checkerFalse := func(_ context.Context, _ string) (bool, error) { return false, nil }
 	regFalse := mustBuild(t, NewBuilder().SetTools(tools).WithToolsets([]string{"all"}).WithFeatureChecker(checkerFalse))
 	availableFalse := regFalse.AvailableTools(context.Background())
 	if len(availableFalse) != 1 {
 		t.Fatalf("Expected 1 tool with false checker, got %d", len(availableFalse))
+	}
+	if availableFalse[0].Tool.Name != "always_available" {
+		t.Errorf("Expected always_available, got %s", availableFalse[0].Tool.Name)
 	}
 
 	// With feature checker returning true for "my_feature", tool should be included
@@ -1135,7 +1103,7 @@ func TestFeatureFlagDisable(t *testing.T) {
 		mockToolWithFlags("disabled_by_flag", "toolset1", true, "", "kill_switch"),
 	}
 
-	// Without feature checker, tool with FeatureFlagDisable should be included (flag is false)
+	// Without feature checker, feature filtering is skipped.
 	reg := mustBuild(t, NewBuilder().SetTools(tools).WithToolsets([]string{"all"}))
 	available := reg.AvailableTools(context.Background())
 	if len(available) != 2 {
@@ -1204,17 +1172,19 @@ func TestFeatureFlagResources(t *testing.T) {
 	resources := []ServerResourceTemplate{
 		mockResource("always_available", "toolset1", "uri1"),
 		{
-			Template:          mcp.ResourceTemplate{Name: "needs_flag", URITemplate: "uri2"},
-			Toolset:           testToolsetMetadata("toolset1"),
-			FeatureFlagEnable: "my_feature",
+			Template: mcp.ResourceTemplate{Name: "needs_flag", URITemplate: "uri2"},
+			Toolset:  testToolsetMetadata("toolset1"),
+			FeatureRule: NewFeatureRule([]FeatureFlag{"my_feature"}, func(featureAsBool FeatureResolver) bool {
+				return featureAsBool("my_feature")
+			}),
 		},
 	}
 
-	// Without checker, resource with enable flag should be excluded
+	// Without checker, feature-flag filtering is skipped: both resources pass
 	reg := mustBuild(t, NewBuilder().SetResources(resources).WithToolsets([]string{"all"}))
 	available := reg.AvailableResourceTemplates(context.Background())
-	if len(available) != 1 {
-		t.Fatalf("Expected 1 resource without checker, got %d", len(available))
+	if len(available) != 2 {
+		t.Fatalf("Expected 2 resources without checker (filtering skipped), got %d", len(available))
 	}
 
 	// With checker returning true, both should be included
@@ -1229,17 +1199,19 @@ func TestFeatureFlagPrompts(t *testing.T) {
 	prompts := []ServerPrompt{
 		mockPrompt("always_available", "toolset1"),
 		{
-			Prompt:            mcp.Prompt{Name: "needs_flag"},
-			Toolset:           testToolsetMetadata("toolset1"),
-			FeatureFlagEnable: "my_feature",
+			Prompt:  mcp.Prompt{Name: "needs_flag"},
+			Toolset: testToolsetMetadata("toolset1"),
+			FeatureRule: NewFeatureRule([]FeatureFlag{"my_feature"}, func(featureAsBool FeatureResolver) bool {
+				return featureAsBool("my_feature")
+			}),
 		},
 	}
 
-	// Without checker, prompt with enable flag should be excluded
+	// Without checker, feature-flag filtering is skipped: both prompts pass
 	reg := mustBuild(t, NewBuilder().SetPrompts(prompts).WithToolsets([]string{"all"}))
 	available := reg.AvailablePrompts(context.Background())
-	if len(available) != 1 {
-		t.Fatalf("Expected 1 prompt without checker, got %d", len(available))
+	if len(available) != 2 {
+		t.Fatalf("Expected 2 prompts without checker (filtering skipped), got %d", len(available))
 	}
 
 	// With checker returning true, both should be included
@@ -1248,6 +1220,124 @@ func TestFeatureFlagPrompts(t *testing.T) {
 	if len(regWithChecker.AvailablePrompts(context.Background())) != 2 {
 		t.Errorf("Expected 2 prompts with checker, got %d", len(regWithChecker.AvailablePrompts(context.Background())))
 	}
+}
+
+func TestRegisterAllSharesFeatureResolution(t *testing.T) {
+	const feature = FeatureFlag("shared")
+	rule := NewFeatureRule([]FeatureFlag{feature}, func(featureAsBool FeatureResolver) bool {
+		return featureAsBool(feature)
+	})
+	tool := mockTool("tool", "toolset1", true)
+	tool.FeatureRule = rule
+	resource := mockResource("resource", "toolset1", "test://{id}")
+	resource.FeatureRule = rule
+	prompt := mockPrompt("prompt", "toolset1")
+	prompt.FeatureRule = rule
+
+	calls := 0
+	checker := func(context.Context, string) (bool, error) {
+		calls++
+		return calls == 1, nil
+	}
+	inv := mustBuild(t, NewBuilder().
+		SetTools([]ServerTool{tool}).
+		SetResources([]ServerResourceTemplate{resource}).
+		SetPrompts([]ServerPrompt{prompt}).
+		WithToolsets([]string{"all"}).
+		WithFeatureChecker(checker))
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "v0.0.1"}, nil)
+	inv.RegisterAll(context.Background(), server, nil)
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(context.Background(), serverTransport, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = serverSession.Close() })
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v0.0.1"}, nil)
+	clientSession, err := client.Connect(context.Background(), clientTransport, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = clientSession.Close() })
+
+	tools, err := clientSession.ListTools(context.Background(), nil)
+	require.NoError(t, err)
+	require.Len(t, tools.Tools, 1)
+	resources, err := clientSession.ListResourceTemplates(context.Background(), nil)
+	require.NoError(t, err)
+	require.Len(t, resources.ResourceTemplates, 1)
+	prompts, err := clientSession.ListPrompts(context.Background(), nil)
+	require.NoError(t, err)
+	require.Len(t, prompts.Prompts, 1)
+	require.Equal(t, 1, calls)
+}
+
+func TestRequiredFeaturesReflectNarrowedInventory(t *testing.T) {
+	tools := []ServerTool{
+		mockToolWithFlags("tool_x", "toolset1", true, "x", ""),
+		mockToolWithFlags("tool_y", "toolset1", true, "y", ""),
+	}
+	inv := mustBuild(t, NewBuilder().
+		SetTools(tools).
+		WithToolsets([]string{"all"}))
+
+	require.Equal(t, []FeatureFlag{"x", "y"}, inv.RequiredFeatures())
+
+	narrowed := inv.ForMCPRequest(MCPMethodToolsCall, "tool_x")
+	require.Equal(t, []FeatureFlag{"x"}, narrowed.RequiredFeatures())
+}
+
+func TestBuilderCopiesFeatureRuleItems(t *testing.T) {
+	toolFeatures := []FeatureFlag{"tool"}
+	toolRule := NewFeatureRule(toolFeatures, func(featureAsBool FeatureResolver) bool {
+		return featureAsBool("tool")
+	})
+	resourceRule := NewFeatureRule([]FeatureFlag{"resource"}, func(featureAsBool FeatureResolver) bool {
+		return featureAsBool("resource")
+	})
+	promptRule := NewFeatureRule([]FeatureFlag{"prompt"}, func(featureAsBool FeatureResolver) bool {
+		return featureAsBool("prompt")
+	})
+	tools := []ServerTool{mockTool("tool", "toolset1", true)}
+	tools[0].FeatureRule = toolRule
+	resources := []ServerResourceTemplate{mockResource("resource", "toolset1", "uri")}
+	resources[0].FeatureRule = resourceRule
+	prompts := []ServerPrompt{mockPrompt("prompt", "toolset1")}
+	prompts[0].FeatureRule = promptRule
+	builder := NewBuilder().
+		SetTools(tools).
+		SetResources(resources).
+		SetPrompts(prompts).
+		WithToolsets([]string{"all"})
+
+	toolFeatures[0] = "changed"
+	tools[0].FeatureRule = NewFeatureRule([]FeatureFlag{"changed"}, func(featureAsBool FeatureResolver) bool {
+		return featureAsBool("changed")
+	})
+	resources[0].FeatureRule = tools[0].FeatureRule
+	prompts[0].FeatureRule = tools[0].FeatureRule
+	inv := mustBuild(t, builder)
+
+	want := []FeatureFlag{"prompt", "resource", "tool"}
+	require.Equal(t, want, inv.RequiredFeatures())
+}
+
+func TestMetadataBehaviorRemainsLive(t *testing.T) {
+	meta := mcp.Meta{
+		"typed_map": map[string]string{"value": "original"},
+		"bytes":     []byte("original"),
+		"invalid":   make(chan int),
+	}
+	tool := mockTool("tool", "toolset1", true)
+	tool.Tool.Meta = meta
+	inv, err := NewBuilder().SetTools([]ServerTool{tool}).Build()
+	require.NoError(t, err)
+
+	meta["ui"] = map[string]any{"resourceUri": "ui://live"}
+	meta["typed_map"].(map[string]string)["value"] = "changed"
+	meta["bytes"].([]byte)[0] = 'X'
+
+	require.Empty(t, inv.RequiredFeatures())
+	available := inv.AllTools()
+	require.Equal(t, "changed", available[0].Tool.Meta["typed_map"].(map[string]string)["value"])
+	require.Equal(t, byte('X'), available[0].Tool.Meta["bytes"].([]byte)[0])
 }
 
 func TestServerToolHasHandler(t *testing.T) {
@@ -1525,9 +1615,11 @@ func TestEnabledAndFeatureFlagInteraction(t *testing.T) {
 	}
 
 	// Feature flag not enabled - tool should be excluded despite Enabled returning true
+	checkerOff := func(_ context.Context, _ string) (bool, error) { return false, nil }
 	reg1 := mustBuild(t, NewBuilder().
 		SetTools([]ServerTool{tool}).
-		WithToolsets([]string{"all"}))
+		WithToolsets([]string{"all"}).
+		WithFeatureChecker(checkerOff))
 	available1 := reg1.AvailableTools(context.Background())
 	if len(available1) != 0 {
 		t.Error("Tool should be excluded when feature flag is not enabled")
@@ -1693,10 +1785,9 @@ func TestFilteredToolsMatchesAvailableTools(t *testing.T) {
 func TestFilteringOrder(t *testing.T) {
 	// Test that filters are applied in the correct order:
 	// 1. Tool.Enabled
-	// 2. Feature flags
-	// 3. Read-only
-	// 4. Builder filters
-	// 5. Toolset/additional tools
+	// 2. Read-only and builder filters
+	// 3. Toolset and MCP availability filters
+	// 4. Feature rule
 
 	callOrder := []string{}
 
@@ -1723,10 +1814,12 @@ func TestFilteringOrder(t *testing.T) {
 		WithFeatureChecker(checker).
 		WithFilter(filter))
 
+	// We're testing the AvailableTools filter order here.
+	callOrder = callOrder[:0]
+
 	_ = reg.AvailableTools(context.Background())
 
-	// Expected order: Enabled, FeatureFlag, ReadOnly (stops here because it's write tool)
-	expectedOrder := []string{"Enabled", "FeatureFlag"}
+	expectedOrder := []string{"Enabled"}
 	if len(callOrder) != len(expectedOrder) {
 		t.Errorf("Expected %d checks, got %d: %v", len(expectedOrder), len(callOrder), callOrder)
 	}
@@ -1738,10 +1831,152 @@ func TestFilteringOrder(t *testing.T) {
 	}
 }
 
+func TestReadOnlySkipsWriteToolFeatureChecks(t *testing.T) {
+	writeTool := mockToolWithFlags("write_tool", "toolset1", false, "write_feature", "")
+	readTool := mockTool("read_tool", "toolset1", true)
+	calls := 0
+	checker := func(_ context.Context, _ string) (bool, error) {
+		calls++
+		return true, nil
+	}
+
+	inv := mustBuild(t, NewBuilder().
+		SetTools([]ServerTool{writeTool, readTool}).
+		WithToolsets([]string{"all"}).
+		WithReadOnly(true).
+		WithFeatureChecker(checker))
+
+	available := inv.AvailableTools(context.Background())
+	require.Len(t, available, 1)
+	require.Equal(t, "read_tool", available[0].Tool.Name)
+	require.Zero(t, calls)
+}
+
+func TestStaticFiltersRunBeforeFeatureChecks(t *testing.T) {
+	rule := func(feature FeatureFlag) FeatureRule {
+		return NewFeatureRule([]FeatureFlag{feature}, func(featureAsBool FeatureResolver) bool {
+			if !featureAsBool(feature) {
+				return false
+			}
+			return featureAsBool(feature)
+		})
+	}
+	readOnlyExcluded := mockTool("write", "enabled", false)
+	readOnlyExcluded.FeatureRule = rule("write")
+	toolsetExcluded := mockTool("wrong_toolset", "disabled", true)
+	toolsetExcluded.FeatureRule = rule("wrong_toolset")
+	filterExcluded := mockTool("filtered", "enabled", true)
+	filterExcluded.FeatureRule = rule("filtered")
+	enabledExcluded := mockTool("enabled_false", "enabled", true)
+	enabledExcluded.FeatureRule = rule("enabled_false")
+	enabledExcluded.Enabled = func(context.Context) (bool, error) { return false, nil }
+	protocolExcluded := mockTool("protocol", "enabled", true)
+	protocolExcluded.FeatureRule = rule("protocol")
+	protocolExcluded.MinimumProtocolVersion = ProtocolVersionMultiRoundTrip
+	elicitationExcluded := mockTool("elicitation", "enabled", true)
+	elicitationExcluded.FeatureRule = rule("elicitation")
+	elicitationExcluded.RequiredElicitationMode = ElicitationModeForm
+	survivor := mockTool("survivor", "enabled", true)
+	survivor.FeatureRule = rule("survivor")
+	resource := mockResource("resource", "disabled", "test://resource")
+	resource.FeatureRule = rule("resource")
+	prompt := mockPrompt("prompt", "disabled")
+	prompt.FeatureRule = rule("prompt")
+
+	calls := make(map[string]int)
+	checker := func(_ context.Context, feature string) (bool, error) {
+		time.Sleep(time.Millisecond)
+		calls[feature]++
+		return true, nil
+	}
+	inv := mustBuild(t, NewBuilder().
+		SetTools([]ServerTool{
+			readOnlyExcluded,
+			toolsetExcluded,
+			filterExcluded,
+			enabledExcluded,
+			protocolExcluded,
+			elicitationExcluded,
+			survivor,
+		}).
+		SetResources([]ServerResourceTemplate{resource}).
+		SetPrompts([]ServerPrompt{prompt}).
+		WithToolsets([]string{"enabled"}).
+		WithReadOnly(true).
+		WithFeatureChecker(checker).
+		WithFilter(func(_ context.Context, tool *ServerTool) (bool, error) {
+			return tool.Tool.Name != "filtered", nil
+		}))
+
+	ctx := ghcontext.WithMCPMethodInfo(context.Background(), &ghcontext.MCPMethodInfo{
+		Method:             MCPMethodToolsList,
+		ProtocolVersion:    "2025-11-25",
+		ClientCapabilities: &mcp.ClientCapabilities{Elicitation: &mcp.ElicitationCapabilities{URL: &mcp.URLElicitationCapabilities{}}},
+	})
+	require.Len(t, inv.AvailableTools(ctx), 1)
+	require.Empty(t, inv.AvailableResourceTemplates(ctx))
+	require.Empty(t, inv.AvailablePrompts(ctx))
+	require.Equal(t, map[string]int{"survivor": 1}, calls)
+}
+
+func TestMCPAvailabilityRunsBeforeFeatureChecks(t *testing.T) {
+	rule := NewFeatureRule([]FeatureFlag{"feature"}, func(featureAsBool FeatureResolver) bool {
+		return featureAsBool("feature")
+	})
+	protocolTool := mockTool("protocol", "toolset1", true)
+	protocolTool.FeatureRule = rule
+	protocolTool.MinimumProtocolVersion = ProtocolVersionMultiRoundTrip
+	elicitationTool := mockTool("elicitation", "toolset1", true)
+	elicitationTool.FeatureRule = rule
+	elicitationTool.RequiredElicitationMode = ElicitationModeForm
+
+	for _, method := range []string{MCPMethodToolsList, MCPMethodToolsCall} {
+		t.Run(method, func(t *testing.T) {
+			calls := 0
+			checker := func(_ context.Context, _ string) (bool, error) {
+				time.Sleep(time.Millisecond)
+				calls++
+				return true, nil
+			}
+			inv := mustBuild(t, NewBuilder().
+				SetTools([]ServerTool{protocolTool, elicitationTool}).
+				WithToolsets([]string{"all"}).
+				WithFeatureChecker(checker))
+			ctx := ghcontext.WithMCPMethodInfo(context.Background(), &ghcontext.MCPMethodInfo{
+				Method:             method,
+				ProtocolVersion:    "2025-11-25",
+				ClientCapabilities: &mcp.ClientCapabilities{Elicitation: &mcp.ElicitationCapabilities{URL: &mcp.URLElicitationCapabilities{}}},
+			})
+
+			if method == MCPMethodToolsList {
+				require.Empty(t, inv.AvailableTools(ctx))
+			} else {
+				require.Len(t, inv.AvailableTools(ctx), 2)
+			}
+			require.Zero(t, calls)
+
+			ctx = ghcontext.WithMCPMethodInfo(context.Background(), &ghcontext.MCPMethodInfo{
+				Method:          method,
+				ProtocolVersion: ProtocolVersionMultiRoundTrip,
+				ClientCapabilities: &mcp.ClientCapabilities{
+					Elicitation: &mcp.ElicitationCapabilities{Form: &mcp.FormElicitationCapabilities{}},
+				},
+			})
+			require.Len(t, inv.AvailableTools(ctx), 2)
+			require.Equal(t, 1, calls)
+
+			calls = 0
+			ctx = ghcontext.WithMCPMethodInfo(context.Background(), &ghcontext.MCPMethodInfo{Method: method})
+			require.Len(t, inv.AvailableTools(ctx), 2)
+			require.Equal(t, 1, calls)
+		})
+	}
+}
+
 func TestForMCPRequest_ToolsCall_FeatureFlaggedVariants(t *testing.T) {
 	// Simulate the get_job_logs scenario: two tools with the same name but different feature flags
-	// - "get_job_logs" with FeatureFlagDisable (available when flag is OFF)
-	// - "get_job_logs" with FeatureFlagEnable (available when flag is ON)
+	// - one "get_job_logs" variant available when the flag is off
+	// - one "get_job_logs" variant available when the flag is on
 	tools := []ServerTool{
 		mockToolWithFlags("get_job_logs", "actions", true, "", "consolidated_flag"), // disabled when flag is ON
 		mockToolWithFlags("get_job_logs", "actions", true, "consolidated_flag", ""), // enabled when flag is ON
@@ -1749,17 +1984,18 @@ func TestForMCPRequest_ToolsCall_FeatureFlaggedVariants(t *testing.T) {
 	}
 
 	// Test 1: Flag is OFF - first tool variant should be available
+	checkerOff := func(_ context.Context, _ string) (bool, error) { return false, nil }
 	regFlagOff := mustBuild(t, NewBuilder().
 		SetTools(tools).
-		WithToolsets([]string{"all"}))
+		WithToolsets([]string{"all"}).
+		WithFeatureChecker(checkerOff))
 	filteredOff := regFlagOff.ForMCPRequest(MCPMethodToolsCall, "get_job_logs")
 	availableOff := filteredOff.AvailableTools(context.Background())
 	if len(availableOff) != 1 {
 		t.Fatalf("Flag OFF: Expected 1 tool, got %d", len(availableOff))
 	}
-	if availableOff[0].FeatureFlagDisable != "consolidated_flag" {
-		t.Errorf("Flag OFF: Expected tool with FeatureFlagDisable, got FeatureFlagEnable=%q, FeatureFlagDisable=%q",
-			availableOff[0].FeatureFlagEnable, availableOff[0].FeatureFlagDisable)
+	if !availableOff[0].FeatureRule.Enabled(func(FeatureFlag) bool { return false }) {
+		t.Error("Flag OFF: expected the flag-off feature rule")
 	}
 
 	// Test 2: Flag is ON - second tool variant should be available
@@ -1775,16 +2011,15 @@ func TestForMCPRequest_ToolsCall_FeatureFlaggedVariants(t *testing.T) {
 	if len(availableOn) != 1 {
 		t.Fatalf("Flag ON: Expected 1 tool, got %d", len(availableOn))
 	}
-	if availableOn[0].FeatureFlagEnable != "consolidated_flag" {
-		t.Errorf("Flag ON: Expected tool with FeatureFlagEnable, got FeatureFlagEnable=%q, FeatureFlagDisable=%q",
-			availableOn[0].FeatureFlagEnable, availableOn[0].FeatureFlagDisable)
+	if !availableOn[0].FeatureRule.Enabled(func(FeatureFlag) bool { return true }) {
+		t.Error("Flag ON: expected the flag-on feature rule")
 	}
 }
 
 // TestWithTools_DeprecatedAliasAndFeatureFlag tests that deprecated aliases work correctly
 // when the old tool is controlled by a feature flag. This covers the scenario where:
-// - Old tool "old_tool" has FeatureFlagDisable="my_flag" (available when flag is OFF)
-// - New tool "new_tool" has FeatureFlagEnable="my_flag" (available when flag is ON)
+// - Old tool "old_tool" is available when the flag is off
+// - New tool "new_tool" is available when the flag is on
 // - Deprecated alias maps "old_tool" -> "new_tool"
 // - User specifies --tools=old_tool
 // Expected behavior:
@@ -1801,11 +2036,13 @@ func TestWithTools_DeprecatedAliasAndFeatureFlag(t *testing.T) {
 
 	// Test 1: Flag OFF - old_tool should be available via direct name match
 	// (not via alias resolution to new_tool, since old_tool still exists)
+	checkerOff := func(_ context.Context, _ string) (bool, error) { return false, nil }
 	regFlagOff := mustBuild(t, NewBuilder().
 		SetTools(tools).
 		WithDeprecatedAliases(deprecatedAliases).
 		WithToolsets([]string{}).        // No toolsets enabled
-		WithTools([]string{"old_tool"})) // Explicitly request old tool
+		WithTools([]string{"old_tool"}). // Explicitly request old tool
+		WithFeatureChecker(checkerOff))
 	availableOff := regFlagOff.AvailableTools(context.Background())
 	if len(availableOff) != 1 {
 		t.Fatalf("Flag OFF: Expected 1 tool, got %d", len(availableOff))
@@ -1835,7 +2072,7 @@ func TestWithTools_DeprecatedAliasAndFeatureFlag(t *testing.T) {
 
 // mockToolWithMeta creates a ServerTool with Meta for testing insiders mode
 func mockToolWithMeta(name string, toolsetID string, meta map[string]any) ServerTool {
-	return NewServerToolFromHandler(
+	return NewServerTool(
 		mcp.Tool{
 			Name: name,
 			Annotations: &mcp.ToolAnnotations{
@@ -1845,53 +2082,79 @@ func mockToolWithMeta(name string, toolsetID string, meta map[string]any) Server
 			Meta:        meta,
 		},
 		testToolsetMetadata(toolsetID),
-		func(_ any) mcp.ToolHandler {
-			return func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-				return nil, nil
-			}
+		func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return nil, nil
 		},
 	)
 }
 
-func TestWithInsidersMode_DisabledStripsUIMetadata(t *testing.T) {
+func TestWithMCPApps_UnsupportedClientStripsUIMetadata(t *testing.T) {
 	toolWithUI := mockToolWithMeta("tool_with_ui", "toolset1", map[string]any{
 		"ui":          map[string]any{"html": "<div>hello</div>"},
 		"description": "kept",
 	})
 
-	// Default: insiders mode is disabled - UI meta should be stripped
 	reg := mustBuild(t, NewBuilder().SetTools([]ServerTool{toolWithUI}).WithToolsets([]string{"all"}))
-	available := reg.AvailableTools(context.Background())
+	registered := captureRegisteredTools(ghcontext.WithUISupport(context.Background(), false), t, reg)
 
-	require.Len(t, available, 1)
-	// UI metadata should be stripped
-	if available[0].Tool.Meta["ui"] != nil {
+	require.Len(t, registered, 1)
+	if registered[0].Meta["ui"] != nil {
 		t.Errorf("Expected 'ui' meta to be stripped, but it was present")
 	}
-	// Other metadata should be preserved
-	if available[0].Tool.Meta["description"] != "kept" {
-		t.Errorf("Expected 'description' meta to be preserved, got %v", available[0].Tool.Meta["description"])
+	if registered[0].Meta["description"] != "kept" {
+		t.Errorf("Expected 'description' meta to be preserved, got %v", registered[0].Meta["description"])
 	}
 }
 
-func TestWithInsidersMode_EnabledPreservesUIMetadata(t *testing.T) {
+func TestWithMCPApps_UnsupportedClientOmitsAppOnlyTools(t *testing.T) {
+	appOnly := mockToolWithMeta("app_only", "toolset1", map[string]any{
+		"ui": map[string]any{"visibility": []string{"app"}},
+	})
+	appOnlyAny := mockToolWithMeta("app_only_any", "toolset1", map[string]any{
+		"ui": map[string]any{"visibility": []any{"app"}},
+	})
+	modelAndApp := mockToolWithMeta("model_and_app", "toolset1", map[string]any{
+		"ui": map[string]any{"resourceUri": "ui://x", "visibility": []string{"model", "app"}},
+	})
+	noVisibility := mockToolWithMeta("no_visibility", "toolset1", map[string]any{
+		"ui": map[string]any{"resourceUri": "ui://y"},
+	})
+	reg := mustBuild(t, NewBuilder().
+		SetTools([]ServerTool{appOnly, appOnlyAny, modelAndApp, noVisibility}).
+		WithToolsets([]string{"all"}))
+
+	stripped := reg.ToolsForRegistration(ghcontext.WithUISupport(context.Background(), false))
+	names := make([]string, 0, len(stripped))
+	for _, tool := range stripped {
+		names = append(names, tool.Tool.Name)
+		require.Nil(t, tool.Tool.Meta["ui"], "ui meta should be stripped from %s", tool.Tool.Name)
+	}
+	require.ElementsMatch(t, []string{"model_and_app", "no_visibility"}, names)
+
+	for _, ctx := range []context.Context{
+		context.Background(),
+		ghcontext.WithUISupport(context.Background(), true),
+	} {
+		require.Len(t, reg.ToolsForRegistration(ctx), 4, "app-only tools should be kept when UI is supported or unknown")
+	}
+}
+
+func TestWithMCPApps_PreservesUIMetadataByDefault(t *testing.T) {
 	uiData := map[string]any{"html": "<div>hello</div>"}
 	toolWithUI := mockToolWithMeta("tool_with_ui", "toolset1", map[string]any{
 		"ui":          uiData,
 		"description": "kept",
 	})
 
-	// Insiders mode enabled - UI meta should be preserved
 	reg := mustBuild(t, NewBuilder().
 		SetTools([]ServerTool{toolWithUI}).
-		WithToolsets([]string{"all"}).
-		WithInsidersMode(true))
-	available := reg.AvailableTools(context.Background())
+		WithToolsets([]string{"all"}))
+	available := reg.ToolsForRegistration(context.Background())
 
 	require.Len(t, available, 1)
 	// UI metadata should be preserved
 	if available[0].Tool.Meta["ui"] == nil {
-		t.Errorf("Expected 'ui' meta to be preserved in insiders mode")
+		t.Errorf("Expected 'ui' meta to be preserved")
 	}
 	// Other metadata should also be preserved
 	if available[0].Tool.Meta["description"] != "kept" {
@@ -1899,48 +2162,13 @@ func TestWithInsidersMode_EnabledPreservesUIMetadata(t *testing.T) {
 	}
 }
 
-func TestWithInsidersMode_EnabledPreservesInsidersOnlyTools(t *testing.T) {
-	normalTool := mockTool("normal", "toolset1", true)
-	insidersTool := mockTool("insiders_only", "toolset1", true)
-	insidersTool.InsidersOnly = true
-
-	// With insiders mode enabled, both tools should be available
-	reg := mustBuild(t, NewBuilder().
-		SetTools([]ServerTool{normalTool, insidersTool}).
-		WithToolsets([]string{"all"}).
-		WithInsidersMode(true))
-	available := reg.AvailableTools(context.Background())
-
-	require.Len(t, available, 2)
-	names := []string{available[0].Tool.Name, available[1].Tool.Name}
-	require.Contains(t, names, "normal")
-	require.Contains(t, names, "insiders_only")
-}
-
-func TestWithInsidersMode_DisabledRemovesInsidersOnlyTools(t *testing.T) {
-	normalTool := mockTool("normal", "toolset1", true)
-	insidersTool := mockTool("insiders_only", "toolset1", true)
-	insidersTool.InsidersOnly = true
-
-	// With insiders mode disabled, insiders-only tool should be removed
-	reg := mustBuild(t, NewBuilder().
-		SetTools([]ServerTool{normalTool, insidersTool}).
-		WithToolsets([]string{"all"}).
-		WithInsidersMode(false))
-	available := reg.AvailableTools(context.Background())
-
-	require.Len(t, available, 1)
-	require.Equal(t, "normal", available[0].Tool.Name)
-}
-
-func TestWithInsidersMode_ToolsWithoutUIMetaUnaffected(t *testing.T) {
+func TestWithMCPApps_ToolsWithoutUIMetaUnaffected(t *testing.T) {
 	toolNoUI := mockToolWithMeta("tool_no_ui", "toolset1", map[string]any{
 		"description": "kept",
 		"version":     "1.0",
 	})
 	toolNilMeta := mockTool("tool_nil_meta", "toolset1", true)
 
-	// Test with insiders disabled
 	reg := mustBuild(t, NewBuilder().
 		SetTools([]ServerTool{toolNoUI, toolNilMeta}).
 		WithToolsets([]string{"all"}))
@@ -1973,8 +2201,7 @@ func TestWithInsidersMode_ToolsWithoutUIMetaUnaffected(t *testing.T) {
 	}
 }
 
-func TestWithInsidersMode_UIOnlyMetaBecomesNil(t *testing.T) {
-	// Tool with ONLY ui metadata - should become nil after stripping
+func TestWithMCPApps_UIOnlyMetaBecomesNil(t *testing.T) {
 	toolUIOnly := mockToolWithMeta("tool_ui_only", "toolset1", map[string]any{
 		"ui": map[string]any{"html": "<div>hello</div>"},
 	})
@@ -1982,47 +2209,59 @@ func TestWithInsidersMode_UIOnlyMetaBecomesNil(t *testing.T) {
 	reg := mustBuild(t, NewBuilder().
 		SetTools([]ServerTool{toolUIOnly}).
 		WithToolsets([]string{"all"}))
-	available := reg.AvailableTools(context.Background())
+	registered := captureRegisteredTools(ghcontext.WithUISupport(context.Background(), false), t, reg)
 
-	require.Len(t, available, 1)
-	// Meta should be nil since ui was the only key
-	if available[0].Tool.Meta != nil {
-		t.Errorf("Expected Meta to be nil after stripping only key, got %v", available[0].Tool.Meta)
+	require.Len(t, registered, 1)
+	if registered[0].Meta != nil {
+		t.Errorf("Expected Meta to be nil after stripping only key, got %v", registered[0].Meta)
 	}
 }
 
-func TestStripInsidersMetaFromTool(t *testing.T) {
+func TestStripMetaKeys(t *testing.T) {
 	tests := []struct {
 		name         string
 		meta         map[string]any
+		keys         []string
 		expectChange bool
 		expectedMeta map[string]any // nil means Meta should be nil
 	}{
 		{
 			name:         "nil meta - no change",
 			meta:         nil,
+			keys:         mcpAppsMetaKeys,
 			expectChange: false,
 		},
 		{
-			name:         "no insiders keys - no change",
+			name:         "no matching keys - no change",
 			meta:         map[string]any{"description": "test", "version": "1.0"},
+			keys:         mcpAppsMetaKeys,
 			expectChange: false,
 		},
 		{
 			name:         "ui key only - becomes nil",
 			meta:         map[string]any{"ui": "data"},
+			keys:         mcpAppsMetaKeys,
 			expectChange: true,
 			expectedMeta: nil,
 		},
 		{
 			name:         "ui key with other keys - ui stripped",
 			meta:         map[string]any{"ui": "data", "description": "kept"},
+			keys:         mcpAppsMetaKeys,
 			expectChange: true,
 			expectedMeta: map[string]any{"description": "kept"},
 		},
 		{
-			name:         "ui is nil value - no change (nil value means key not present)",
+			name:         "ui is nil value - ui stripped",
 			meta:         map[string]any{"ui": nil, "description": "kept"},
+			keys:         mcpAppsMetaKeys,
+			expectChange: true,
+			expectedMeta: map[string]any{"description": "kept"},
+		},
+		{
+			name:         "empty keys list - no change",
+			meta:         map[string]any{"ui": "data"},
+			keys:         []string{},
 			expectChange: false,
 		},
 	}
@@ -2030,7 +2269,7 @@ func TestStripInsidersMetaFromTool(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tool := mockToolWithMeta("test", "toolset1", tt.meta)
-			result := stripInsidersMetaFromTool(tool)
+			result := stripMetaKeys(tool, tt.keys)
 
 			if tt.expectChange {
 				require.NotNil(t, result, "expected change but got nil")
@@ -2050,14 +2289,14 @@ func TestStripInsidersMetaFromTool(t *testing.T) {
 	}
 }
 
-func TestStripInsidersFeatures(t *testing.T) {
+func TestStripMCPAppsMetadata(t *testing.T) {
 	tools := []ServerTool{
 		mockToolWithMeta("tool1", "toolset1", map[string]any{"ui": "data"}),
 		mockToolWithMeta("tool2", "toolset1", map[string]any{"description": "kept"}),
 		mockTool("tool3", "toolset1", true), // nil meta
 	}
 
-	result := stripInsidersFeatures(tools)
+	result := stripMCPAppsMetadata(tools)
 
 	require.Len(t, result, 3)
 
@@ -2072,33 +2311,9 @@ func TestStripInsidersFeatures(t *testing.T) {
 	require.Nil(t, result[2].Tool.Meta)
 }
 
-func TestStripInsidersFeatures_RemovesInsidersOnlyTools(t *testing.T) {
-	// Create tools: one normal, one insiders-only, one normal
-	normalTool1 := mockTool("normal1", "toolset1", true)
-	insidersTool := mockTool("insiders_only", "toolset1", true)
-	insidersTool.InsidersOnly = true
-	normalTool2 := mockTool("normal2", "toolset1", true)
-
-	tools := []ServerTool{normalTool1, insidersTool, normalTool2}
-
-	result := stripInsidersFeatures(tools)
-
-	// Should only have 2 tools (insiders-only tool filtered out)
-	require.Len(t, result, 2)
-	require.Equal(t, "normal1", result[0].Tool.Name)
-	require.Equal(t, "normal2", result[1].Tool.Name)
-}
-
-func TestInsidersOnlyMetaKeys_FutureAdditions(t *testing.T) {
+func TestStripMetaKeys_MultipleKeys(t *testing.T) {
 	// This test verifies the mechanism works for multiple keys
-	// If we add new experimental keys to insidersOnlyMetaKeys, they should be stripped
-
-	// Save original and restore after test
-	originalKeys := insidersOnlyMetaKeys
-	defer func() { insidersOnlyMetaKeys = originalKeys }()
-
-	// Add a hypothetical future experimental key
-	insidersOnlyMetaKeys = []string{"ui", "experimental_feature", "beta"}
+	keys := []string{"ui", "experimental_feature", "beta"}
 
 	tool := mockToolWithMeta("test", "toolset1", map[string]any{
 		"ui":                   "ui data",
@@ -2107,7 +2322,7 @@ func TestInsidersOnlyMetaKeys_FutureAdditions(t *testing.T) {
 		"description":          "kept",
 	})
 
-	result := stripInsidersMetaFromTool(tool)
+	result := stripMetaKeys(tool, keys)
 
 	require.NotNil(t, result)
 	require.NotNil(t, result.Tool.Meta)
@@ -2117,13 +2332,13 @@ func TestInsidersOnlyMetaKeys_FutureAdditions(t *testing.T) {
 	require.Equal(t, "kept", result.Tool.Meta["description"], "description should be preserved")
 }
 
-func TestWithInsidersMode_DoesNotMutateOriginalTools(t *testing.T) {
+func TestWithMCPApps_DoesNotMutateOriginalTools(t *testing.T) {
 	originalMeta := map[string]any{"ui": "data", "description": "kept"}
 	tool := mockToolWithMeta("test", "toolset1", originalMeta)
 	tools := []ServerTool{tool}
 
-	// Build with insiders disabled - should strip ui
-	_ = mustBuild(t, NewBuilder().SetTools(tools).WithToolsets([]string{"all"}))
+	reg := mustBuild(t, NewBuilder().SetTools(tools).WithToolsets([]string{"all"}))
+	_ = reg.ToolsForRegistration(ghcontext.WithUISupport(context.Background(), false))
 
 	// Original tool should be unchanged
 	require.Equal(t, "data", tools[0].Tool.Meta["ui"], "original tool should not be mutated")
@@ -2276,4 +2491,69 @@ func TestCreateExcludeToolsFilter(t *testing.T) {
 	allowed, err = filter(context.Background(), &allowedTool)
 	require.NoError(t, err)
 	require.True(t, allowed, "allowed_tool should be included")
+}
+
+// captureRegisteredTools mirrors RegisterTools' per-request strip behavior so
+// tests can verify what the wire sees, without requiring tools to have real
+// handlers (RegisterTools panics on tools without HandlerFunc). It delegates
+// to ToolsForRegistration so any future strip added there is picked up
+// automatically.
+func captureRegisteredTools(ctx context.Context, t *testing.T, reg *Inventory) []*mcp.Tool {
+	t.Helper()
+	forReg := reg.ToolsForRegistration(ctx)
+	out := make([]*mcp.Tool, 0, len(forReg))
+	for i := range forReg {
+		toolCopy := forReg[i].Tool
+		out = append(out, &toolCopy)
+	}
+	return out
+}
+
+// TestShouldStripMCPAppsMetadata verifies the spec-conformant strip decision:
+// strip only when the client explicitly does not advertise the
+// io.modelcontextprotocol/ui extension.
+func TestShouldStripMCPAppsMetadata(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		setupCtx func() context.Context
+		want     bool
+	}{
+		{
+			name:     "capability unknown -> keep",
+			setupCtx: context.Background,
+			want:     false,
+		},
+		{
+			name:     "capability present -> keep",
+			setupCtx: func() context.Context { return ghcontext.WithUISupport(context.Background(), true) },
+			want:     false,
+		},
+		{
+			name:     "capability explicitly absent -> strip",
+			setupCtx: func() context.Context { return ghcontext.WithUISupport(context.Background(), false) },
+			want:     true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shouldStripMCPAppsMetadata(tc.setupCtx())
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestForMCPRequest_PreservesInstructions(t *testing.T) {
+	reg := mustBuild(t, NewBuilder().
+		SetTools([]ServerTool{mockTool("tool1", "repos", true)}).
+		WithToolsets([]string{"all"}).
+		WithServerInstructions())
+	want := reg.Instructions()
+	require.NotEmpty(t, want, "expected base inventory to generate instructions")
+	for _, m := range []string{MCPMethodDiscover, MCPMethodInitialize, MCPMethodToolsList} {
+		require.Equal(t, want, reg.ForMCPRequest(m, "").Instructions(),
+			"instructions must be preserved for %s (server identity)", m)
+	}
 }

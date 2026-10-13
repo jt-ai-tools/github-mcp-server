@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"strings"
 
-	ghErrors "github.com/github/github-mcp-server/pkg/errors"
-	"github.com/github/github-mcp-server/pkg/inventory"
-	"github.com/github/github-mcp-server/pkg/scopes"
-	"github.com/github/github-mcp-server/pkg/translations"
-	"github.com/github/github-mcp-server/pkg/utils"
-	"github.com/google/go-github/v82/github"
+	ghErrors "github.com/github/github-mcp-server/v2/pkg/errors"
+	"github.com/github/github-mcp-server/v2/pkg/ifc"
+	"github.com/github/github-mcp-server/v2/pkg/inventory"
+	"github.com/github/github-mcp-server/v2/pkg/scopes"
+	"github.com/github/github-mcp-server/v2/pkg/translations"
+	"github.com/github/github-mcp-server/v2/pkg/utils"
+	"github.com/google/go-github/v92/github"
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -43,8 +44,9 @@ func GetRepositoryTree(t translations.TranslationHelperFunc) inventory.ServerToo
 	return NewTool(
 		ToolsetMetadataGit,
 		mcp.Tool{
-			Name:        "get_repository_tree",
-			Description: t("TOOL_GET_REPOSITORY_TREE_DESCRIPTION", "Get the tree structure (files and directories) of a GitHub repository at a specific ref or SHA"),
+			Name:         "get_repository_tree",
+			OutputSchema: treeOutputSchema(),
+			Description:  t("TOOL_GET_REPOSITORY_TREE_DESCRIPTION", "Get the tree structure (files and directories) of a GitHub repository at a specific ref or SHA"),
 			Annotations: &mcp.ToolAnnotations{
 				Title:        t("TOOL_GET_REPOSITORY_TREE_USER_TITLE", "Get repository tree"),
 				ReadOnlyHint: true,
@@ -77,8 +79,8 @@ func GetRepositoryTree(t translations.TranslationHelperFunc) inventory.ServerToo
 				Required: []string{"owner", "repo"},
 			},
 		},
-		[]scopes.Scope{scopes.Repo},
-		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+		scopes.PublicRead(scopes.Repo),
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, *RepositoryTreeOutput, error) {
 			owner, err := RequiredParam[string](args, "owner")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
@@ -171,7 +173,14 @@ func GetRepositoryTree(t translations.TranslationHelperFunc) inventory.ServerToo
 				return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
 			}
 
-			return utils.NewToolResultText(string(r)), nil, nil
+			result := utils.NewToolResultText(string(r))
+			// The repository tree exposes committed file structure; in public
+			// repos anyone can land content via a PR (untrusted), in private
+			// repos only collaborators can (trusted). Confidentiality follows
+			// repo visibility.
+			result = attachRepoVisibilityIFCLabel(ctx, deps, client, owner, repo, result, ifc.LabelCommitContents)
+			return result, projectRepositoryTree(response), nil
 		},
+		gitGistNormalizer(validateTreeArguments),
 	)
 }

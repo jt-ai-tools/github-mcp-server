@@ -7,8 +7,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/github/github-mcp-server/pkg/http/headers"
-	"github.com/github/github-mcp-server/pkg/utils"
+	"github.com/github/github-mcp-server/v2/pkg/http/headers"
+	"github.com/github/github-mcp-server/v2/pkg/scopes"
+	"github.com/github/github-mcp-server/v2/pkg/utils"
 	"github.com/go-chi/chi/v5"
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
@@ -19,21 +20,13 @@ const (
 	OAuthProtectedResourcePrefix = "/.well-known/oauth-protected-resource"
 )
 
-// SupportedScopes lists all OAuth scopes that may be required by MCP tools.
-var SupportedScopes = []string{
-	"repo",
-	"read:org",
-	"read:user",
-	"user:email",
-	"read:packages",
-	"write:packages",
-	"read:project",
-	"project",
-	"gist",
-	"notifications",
-	"workflow",
-	"codespace",
-}
+// SupportedScopes lists every OAuth scope that an MCP tool may require.
+var SupportedScopes = scopes.SupportedOAuthScopes()
+
+// DefaultScopes are advertised in protected-resource metadata and requested by
+// stdio OAuth unless the operator explicitly supplies --oauth-scopes. Other
+// scopes require opt-in through a per-tool authorization challenge.
+var DefaultScopes = scopes.DefaultOAuthScopes()
 
 // Config holds the OAuth configuration for the MCP server.
 type Config struct {
@@ -49,6 +42,15 @@ type Config struct {
 	// This is used to restore the original path when a proxy strips a base path before forwarding.
 	// If empty, requests are treated as already using the external path.
 	ResourcePath string
+
+	// TrustProxyHeaders indicates whether X-Forwarded-Host and X-Forwarded-Proto
+	// should be honored when deriving the effective host and scheme for OAuth
+	// resource URLs. This must only be enabled when the server is deployed
+	// behind a trusted proxy that sets these headers; otherwise an untrusted
+	// client can influence the OAuth resource metadata URL advertised to MCP
+	// clients. When BaseURL is set, it always takes precedence and these
+	// headers are unused.
+	TrustProxyHeaders bool
 }
 
 // AuthHandler handles OAuth-related HTTP endpoints.
@@ -79,11 +81,14 @@ func NewAuthHandler(cfg *Config, apiHost utils.APIHostResolver) (*AuthHandler, e
 
 // routePatterns defines the route patterns for OAuth protected resource metadata.
 var routePatterns = []string{
-	"",          // Root: /.well-known/oauth-protected-resource
-	"/readonly", // Read-only mode
-	"/insiders", // Insiders mode
+	"", // Root: /.well-known/oauth-protected-resource
+	"/readonly",
+	"/insiders",
+	"/readonly/insiders",
 	"/x/{toolset}",
 	"/x/{toolset}/readonly",
+	"/x/{toolset}/insiders",
+	"/x/{toolset}/readonly/insiders",
 }
 
 // RegisterRoutes registers the OAuth protected resource metadata routes.
@@ -94,6 +99,7 @@ func (h *AuthHandler) RegisterRoutes(r chi.Router) {
 			r.Handle(path, h.metadataHandler())
 		}
 	}
+	r.Handle(OAuthProtectedResourcePrefix+"/*", http.NotFoundHandler())
 }
 
 func (h *AuthHandler) metadataHandler() http.Handler {
@@ -121,7 +127,7 @@ func (h *AuthHandler) metadataHandler() http.Handler {
 			Resource:               resourceURL,
 			AuthorizationServers:   []string{authorizationServerURL},
 			ResourceName:           "GitHub MCP Server",
-			ScopesSupported:        SupportedScopes,
+			ScopesSupported:        DefaultScopes,
 			BearerMethodsSupported: []string{"header"},
 		}
 
@@ -192,22 +198,44 @@ func (h *AuthHandler) buildResourceURL(r *http.Request, resourcePath string) str
 	if !strings.HasPrefix(resourcePath, "/") {
 		resourcePath = "/" + resourcePath
 	}
-	return baseURL + resourcePath
+	return appendRawQuery(baseURL+resourcePath, r.URL.RawQuery)
+}
+
+// appendRawQuery avoids re-encoding the resource identifier that RFC 9728
+// clients compare as an exact string.
+func appendRawQuery(target, rawQuery string) string {
+	if rawQuery == "" {
+		return target
+	}
+	return target + "?" + rawQuery
 }
 
 // GetEffectiveHostAndScheme returns the effective host and scheme for a request.
+//
+// X-Forwarded-Host and X-Forwarded-Proto are only honored when cfg.TrustProxyHeaders
+// is true. Without that opt-in, an untrusted client could otherwise influence the
+// OAuth resource metadata URL advertised to MCP clients.
 func GetEffectiveHostAndScheme(r *http.Request, cfg *Config) (host, scheme string) { //nolint:revive
-	if fh := r.Header.Get(headers.ForwardedHostHeader); fh != "" {
-		host = fh
-	} else {
+	trustProxy := cfg != nil && cfg.TrustProxyHeaders
+
+	if trustProxy {
+		if fh := r.Header.Get(headers.ForwardedHostHeader); fh != "" {
+			host = fh
+		}
+	}
+	if host == "" {
 		host = r.Host
 	}
 	if host == "" {
 		host = "localhost"
 	}
-	if fp := r.Header.Get(headers.ForwardedProtoHeader); fp != "" {
-		scheme = strings.ToLower(fp)
-	} else {
+
+	if trustProxy {
+		if fp := r.Header.Get(headers.ForwardedProtoHeader); fp != "" {
+			scheme = strings.ToLower(fp)
+		}
+	}
+	if scheme == "" {
 		if r.TLS != nil {
 			scheme = "https"
 		} else {
@@ -228,10 +256,13 @@ func BuildResourceMetadataURL(r *http.Request, cfg *Config, resourcePath string)
 			suffix = resourcePath
 		}
 	}
+	metadataURL := ""
 	if cfg != nil && cfg.BaseURL != "" {
-		return strings.TrimSuffix(cfg.BaseURL, "/") + OAuthProtectedResourcePrefix + suffix
+		metadataURL = strings.TrimSuffix(cfg.BaseURL, "/") + OAuthProtectedResourcePrefix + suffix
+	} else {
+		metadataURL = fmt.Sprintf("%s://%s%s%s", scheme, host, OAuthProtectedResourcePrefix, suffix)
 	}
-	return fmt.Sprintf("%s://%s%s%s", scheme, host, OAuthProtectedResourcePrefix, suffix)
+	return appendRawQuery(metadataURL, r.URL.RawQuery)
 }
 
 func normalizeBasePath(path string) string {
